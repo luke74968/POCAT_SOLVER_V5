@@ -1,0 +1,15 @@
+# 가상환경
+venv/
+.env/
+.venv/
+env/
+ENV/
+
+# 파이썬 캐시 파일 무시
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+
+# png 무시
+*.png
