@@ -134,7 +134,7 @@ class PocatEnv(EnvBase):
             rail_type = load.get("independent_rail_type")
             if not rail_type: continue
             
-            load_idx = self.num_nodes - self.generator.num_loads + i
+            load_idx = self.generator.num_nodes - self.generator.num_loads + i
             
             if rail_type == 'exclusive_supplier':
                 # 이 부하(load_idx)를 자식으로 가지려는 부모(p)는 다른 자식이 있으면 안 됨
@@ -163,8 +163,10 @@ class PocatEnv(EnvBase):
             final_mask[:, :, k_idx] &= ~j_ancestors
 
             # j와 k는 같은 부모를 가질 수 없음
-            k_parents = td["adj_matrix"][:, :, k_idx] # (B, N)
-            final_mask[:, k_parents, j_idx] = False
+            is_k_parent_mask = td["adj_matrix"][:, :, k_idx]  # (B, N) 모양의 불리언 마스크
+            # final_mask에서 자식이 j_idx인 슬라이스 (B, N)를 선택한 뒤,
+            # k의 부모인 위치에 False를 적용합니다.
+            final_mask[:, :, j_idx][is_k_parent_mask] = False
 
         return final_mask
     

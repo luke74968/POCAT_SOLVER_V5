@@ -4,6 +4,8 @@
 from collections import defaultdict
 from typing import List, Dict, Tuple
 
+from .pocat_classes import LDO 
+
 def _norm_type(t: str) -> str:
     """타입 명칭 정규화: Buck -> DCDC 로 통일"""
     if not isinstance(t, str):

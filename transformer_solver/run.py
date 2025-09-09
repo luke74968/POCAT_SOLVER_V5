@@ -1,4 +1,4 @@
-# run.py
+# transformer_solver/run.py
 import os
 import sys
 import time
@@ -21,18 +21,18 @@ def setup_logger(result_dir):
     return logger
 
 def main(args):
-    # CPU/GPU 자동 감지 로직
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.log(f"Using device: {device}")
     
+    # --- 👇 1. PocatEnv 생성 시 instance_repeats 인자 제거 ---
     env = PocatEnv(
         generator_params={"config_file_path": args.config_file},
         device=device,
-        instance_repeats=args.instance_repeats,
     )
+    # --- 수정 완료 ---
+
     trainer = PocatTrainer(args, env, device)
 
-    # 💡 --test_only 플래그가 있으면 훈련 대신 test() 함수를 실행
     if args.test_only:
         trainer.test()
     else:
@@ -42,12 +42,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # 훈련 관련 인자
     parser.add_argument("--batch_size", type=int, default=64, help="Training batch_size")
-    parser.add_argument(
-        "--instance_repeats",
-        type=int,
-        default=1,
-        help="Number of times to clone each instance",
-    )    
+ 
     parser.add_argument("--config_file", type=str, default="config.json", help="Path to POCAT config file")
     parser.add_argument("--config_yaml", type=str, default="config.yaml", help="Path to model/training config YAML")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed")
