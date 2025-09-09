@@ -67,7 +67,7 @@ def multi_head_attention(q, k, v, ninf_mask=None):
     weights = nn.Softmax(dim=3)(score_scaled)
     out = torch.matmul(weights, v)
     out_transposed = out.transpose(1, 2)
-    return out_transposed.reshape(batch_s, n, head_num * key_dim)
+    return out_transposed.contiguous().view(batch_s, n, head_num * key_dim)
 
 class EncoderLayer(nn.Module):
     def __init__(self, embedding_dim, head_num, qkv_dim, ffd='siglu', **model_params):

@@ -31,12 +31,20 @@ class PocatConfig:
     loads: List[Dict[str, Any]]
     constraints: Dict[str, Any]
     
-    # 생성된 노드들의 이름과 타입을 저장
     node_names: List[str] = field(default_factory=list)
     node_types: List[int] = field(default_factory=list)
 
     def __post_init__(self):
-        # 배터리, IC, 부하의 이름을 순서대로 저장
+        # 초기 로드 시 한 번만 호출
+        self.rebuild_node_lists()
+
+    def rebuild_node_lists(self):
+        """
+        IC 목록이 변경되었을 때 node_names와 node_types 리스트를 다시 생성합니다.
+        """
+        self.node_names.clear()
+        self.node_types.clear()
+        
         self.node_names.append(self.battery['name'])
         self.node_types.append(NODE_TYPE_BATTERY)
         for ic in self.available_ics:

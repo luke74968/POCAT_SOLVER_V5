@@ -146,11 +146,26 @@ class PocatTrainer:
 
     def visualize_result(self, actions, cost):
         """모델이 생성한 action_sequence를 기반으로 결과를 시각화합니다."""
-        # 💡 2. config 로딩 로직을 공용 함수 호출로 변경하여 매우 간결해짐
-        battery, available_ics, loads, constraints = load_configuration_from_file(self.args.config_file)
-
-        # 💡 3. PocatEnv에 이미 로드된 config 정보를 활용
+        
+        # --- 💡 1. config.json을 다시 로드하는 대신, generator의 확장된 config를 사용 ---
         config = self.env.generator.config
+        battery = Battery(**config.battery)
+        constraints = config.constraints
+        loads = [Load(**ld) for ld in config.loads]
+        
+        # Generator가 동적 복제한 전체 IC 목록(dict)을 가져옴
+        expanded_ic_configs = config.available_ics
+        
+        # 시각화를 위해 dict를 PowerIC 객체로 변환
+        candidate_ics = []
+        for ic_data in expanded_ic_configs:
+            ic_type = ic_data.get('type')
+            if ic_type == 'LDO':
+                candidate_ics.append(LDO(**ic_data))
+            elif ic_type == 'Buck':
+                candidate_ics.append(BuckConverter(**ic_data))
+        # --- 수정 완료 ---
+
         node_names = config.node_names
         
         active_edges = []
@@ -175,7 +190,7 @@ class PocatTrainer:
         
         print_and_visualize_one_solution(
             solution=solution, 
-            candidate_ics=available_ics, 
+            candidate_ics=candidate_ics, # 💡 확장/변환된 IC 리스트 전달
             loads=loads, 
             battery=battery, 
             constraints=constraints, 
