@@ -1,4 +1,5 @@
 # trainer.py
+
 import torch
 from tqdm import tqdm
 import os
@@ -6,9 +7,12 @@ import os
 from common.utils.common import TimeEstimator, clip_grad_norms, unbatchify
 from .model import PocatModel
 from .pocat_env import PocatEnv
-import os # os 모듈 추가
 from common.pocat_visualizer import print_and_visualize_one_solution
+
+# 💡 수정된 import 구문
 from common.pocat_classes import Battery, LDO, BuckConverter, Load
+from common.pocat_defs import PocatConfig, NODE_TYPE_IC # <-- NODE_TYPE_IC를 여기서 가져옵니다.
+from common.config_loader import load_configuration_from_file
 
 
 
@@ -142,21 +146,11 @@ class PocatTrainer:
 
     def visualize_result(self, actions, cost):
         """모델이 생성한 action_sequence를 기반으로 결과를 시각화합니다."""
-        # 💡 3. visualizer가 요구하는 형태로 데이터 재구성
-        
-        # config.json에서 원본 데이터 로드
-        config = self.env.generator.config
-        battery = Battery(**config.battery)
-        constraints = config.constraints
-        loads = [Load(**ld) for ld in config.loads]
-        
-        available_ics = []
-        for ic_data in config.available_ics:
-            ic_type = ic_data.pop('type')
-            if ic_type == 'LDO': available_ics.append(LDO(**ic_data))
-            elif ic_type == 'Buck': available_ics.append(BuckConverter(**ic_data))
-            ic_data['type'] = ic_type # pop 했던 것 복원
+        # 💡 2. config 로딩 로직을 공용 함수 호출로 변경하여 매우 간결해짐
+        battery, available_ics, loads, constraints = load_configuration_from_file(self.args.config_file)
 
+        # 💡 3. PocatEnv에 이미 로드된 config 정보를 활용
+        config = self.env.generator.config
         node_names = config.node_names
         
         active_edges = []
@@ -168,11 +162,9 @@ class PocatTrainer:
             
             active_edges.append((parent_name, child_name))
             
-            # 부모가 IC이면 used_ic_names에 추가
-            if config.node_types[parent_idx] == 1: # NODE_TYPE_IC
+            if config.node_types[parent_idx] == NODE_TYPE_IC:
                  used_ic_names.add(parent_name)
 
-        # OR-Tools의 솔루션과 동일한 dict 구조 생성
         solution = {
             "cost": cost,
             "used_ic_names": used_ic_names,
@@ -181,9 +173,6 @@ class PocatTrainer:
         
         print("\n--- Generated Power Tree (Transformer) ---")
         
-        # 💡 4. 공용 시각화 함수 호출!
-        # Transformer가 생성한 해는 이미 제약조건을 만족한다고 가정하므로,
-        # OR-Tools의 candidate_ics 대신 원본 available_ics를 전달하여 시각화
         print_and_visualize_one_solution(
             solution=solution, 
             candidate_ics=available_ics, 

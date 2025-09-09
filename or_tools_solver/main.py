@@ -1,18 +1,21 @@
-# main.py
+# or_tools_solver/main.py
 
 import json
 import sys
 from dataclasses import asdict
 from ortools.sat.python import cp_model
 
+# 💡 1. 여기서 'load_configuration'을 지우고, 아래에 새로운 import를 추가합니다.
 from .pocat_core import (
-    load_configuration, expand_ic_instances, create_solver_model,
+    expand_ic_instances, create_solver_model,
     find_all_load_distributions
 )
 from common.pocat_visualizer import (
     check_solution_validity, print_and_visualize_one_solution
 )
 from .pocat_preprocess import prune_dominated_ic_instances
+# 💡 2. 새로운 공용 로더에서 함수를 가져옵니다.
+from common.config_loader import load_configuration_from_file
 
 def main():
     """메인 실행 함수"""
@@ -27,15 +30,13 @@ def main():
 
     # 1. 설정 로드
     try:
-        # 💡 3. 하드코딩된 'config.json' 대신 전달받은 파일 이름을 사용합니다.
-        with open(config_filename, 'r', encoding='utf-8') as f:
-            json_config_string = f.read()
+        # 💡 3. 파일 내용을 읽는 대신, 공용 함수를 직접 호출하여 한 번에 로드합니다.
+        battery, available_ics, loads, constraints = load_configuration_from_file(config_filename)
     except FileNotFoundError:
         print(f"오류: 설정 파일 '{config_filename}'을(를) 찾을 수 없습니다.")
         return
         
-    battery, available_ics, loads, constraints = load_configuration(json_config_string)
-    
+   
     # 2. 후보 IC 생성
     candidate_ics, ic_groups = expand_ic_instances(available_ics, loads, battery, constraints)
     
