@@ -130,18 +130,22 @@ class PocatEnv(EnvBase):
             return mask.transpose(1, 2)
 
         elif phase == 1:  # Trajectory 구축 단계
-            # 자식: 현재 Trajectory의 헤드 노드만 가능
             child_indices = td["trajectory_head"].squeeze(-1)
             b_idx = torch.arange(batch_size, device=self.device)
-
-            # [1번 조건] "자기 자신"은 부모가 될 수 없음
+            
+            # [수정] 'can_be_parent' 변수 초기화
+            can_be_parent = torch.ones(batch_size, num_nodes, dtype=torch.bool, device=self.device)
+            
+            node_types = td["nodes"][0, :, :FEATURE_INDEX["node_type"][1]].argmax(-1)
+            is_ic = node_types == NODE_TYPE_IC
+            
+            current_path_mask = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"])
+            
+            # 기본 후보: (아직 사용되지 않은 IC) 또는 (이미 메인 트리에 속한 노드)
+            can_be_parent &= (is_ic.unsqueeze(0) & ~current_path_mask & ~td["main_tree_mask"]) | td["main_tree_mask"]
+            
+            # 자기 자신, 이미 경로에 포함된 노드는 부모가 될 수 없음
             can_be_parent[b_idx, child_indices] = False
-
-            # 현재까지 만들어진 경로상의 모든 노드를 추적
-            path_nodes = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"])
-
-            # [2번 조건] "이미 경로에 포함된 노드"는 부모가 될 수 없음
-            can_be_parent[path_nodes] = False
 
             # 1. 전압 호환성
             head_node_vin_min = td["nodes"][b_idx, child_indices, FEATURE_INDEX["vin_min"]]
@@ -197,32 +201,35 @@ class PocatEnv(EnvBase):
             mask[b_idx, :, child_indices] = can_be_parent
             return mask
     
-    def get_reward(self, td: TensorDict, done: torch.Tensor) -> torch.Tensor:
+    def get_reward(self, td: TensorDict) -> torch.Tensor:
+        """
+        Calculates the reward based on the final state of the power tree.
+        The reward is the negative of the total cost of used ICs.
+        This function is called only when an episode is done.
+        """
         reward = torch.zeros(td.batch_size[0], device=self.device)
+        done = td["done"].squeeze(-1)
+        
         if done.any():
-            # 비용 계산
+            # Calculate cost based on the final adjacency matrix
+            is_used_mask = td["adj_matrix"][done].any(dim=1) | td["adj_matrix"][done].any(dim=2)
+            
             node_costs = td["nodes"][done, :, FEATURE_INDEX["cost"]]
             ic_mask = td["nodes"][done, :, FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1
-            # is_used_mask: connected_nodes_mask에서 배터리 제외
-            is_used_mask = td["connected_nodes_mask"][done].clone()
-            is_used_mask[:, 0] = False
             
             used_ic_mask = is_used_mask & ic_mask
             total_cost = (node_costs * used_ic_mask).sum(dim=-1)
             reward[done] = -total_cost
             
-            # --- 💡 4. 슬립 전류 제약 위반 시 페널티 ---
+            # (Optional) Add penalty for violating sleep current constraint
             max_sleep_current = self.generator.config.constraints.get("max_sleep_current", 0.0)
             if max_sleep_current > 0:
-                # (구현 간소화를 위해 간단한 로직 적용, 실제로는 더 정교한 계산 필요)
-                # Always-on 부하들의 슬립 전류 합계만으로 간단히 계산
                 loads_info = self.generator.config.loads
                 always_on_loads_current = sum(
                     l['current_sleep'] for l in loads_info if l.get('always_on_in_sleep')
                 )
-                # 실제로는 IC의 quiescent/operating current도 전파해야 함
                 if always_on_loads_current > max_sleep_current:
-                    reward[done] -= 100.0 # 큰 페널티
+                    reward[done] -= 100.0 # Large penalty
                     
         return reward.unsqueeze(-1)
         
@@ -268,24 +275,34 @@ class PocatEnv(EnvBase):
         return torch.tensor(path, device=self.device)
 
     def _trace_path_batch(self, b_idx, head_indices, adj_matrix):
-        """배치 전체에 대해, 각 경로의 노드들을 찾는 마스크 반환"""
         num_nodes = adj_matrix.shape[1]
         path_mask = torch.zeros_like(adj_matrix[:, :, 0], dtype=torch.bool)
         path_mask[b_idx, head_indices] = True
         
         current_heads = head_indices
+        active_mask = torch.ones_like(b_idx, dtype=torch.bool)
+
         for _ in range(num_nodes):
-            # 각 배치 샘플마다 current_heads에 해당하는 부모를 찾음
-            # adj_matrix[:, :, current_heads] -> (B, N, B) -> 대각선만 필요
-            parents_connections = adj_matrix[b_idx, :, current_heads] # (B, N)
+            if not active_mask.any():
+                break
+
+            active_b_idx = b_idx[active_mask]
+            active_heads = current_heads[active_mask]
             
-            has_parent = parents_connections.any(dim=1)
-            if not has_parent.any(): break
+            # [수정된 로직]
+            parent_connections = adj_matrix[active_b_idx, :, active_heads]
+
+            found_parent = parent_connections.any(dim=1)
             
-            # 각 배치의 부모 인덱스를 찾음 (하나의 부모만 있다고 가정)
-            parents = parents_connections.argmax(dim=1)
+            if not found_parent.any():
+                break
+                
+            # [수정된 로직] Bool 텐서에 argmax 대신 where 사용
+            new_parents = torch.where(parent_connections.T)[1]
             
-            path_mask[b_idx[has_parent], parents[has_parent]] = True
-            current_heads = parents
+            path_mask[active_b_idx[found_parent], new_parents] = True
+            current_heads[active_mask] = new_parents
+            
+            active_mask[active_mask.clone()] = found_parent
             
         return path_mask
