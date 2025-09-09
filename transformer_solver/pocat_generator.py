@@ -3,7 +3,7 @@ import json
 import torch
 from tensordict import TensorDict
 
-from pocat_defs import (
+from common.pocat_defs import (
     PocatConfig,
     NODE_TYPE_BATTERY,
     NODE_TYPE_IC,

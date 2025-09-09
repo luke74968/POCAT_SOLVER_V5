@@ -5,7 +5,7 @@ from typing import List, Dict, Tuple, Any
 from collections import defaultdict
 from ortools.sat.python import cp_model
 
-from pocat_classes import Battery, Load, PowerIC, LDO, BuckConverter
+from common.pocat_classes import Battery, Load, PowerIC, LDO, BuckConverter
 # 순환 참조를 피하기 위해 함수를 직접 임포트하지 않고, main에서 넘겨받도록 구조 변경
 # from pocat_visualizer import check_solution_validity, print_and_visualize_one_solution
 
@@ -414,7 +414,6 @@ def add_sleep_current_constraints(model, battery, candidate_ics, loads, constrai
     - Buck: q*I_in = p*I_out  (p/q ≈ Vout / (Vin * eff_guess))
     - 모든 곱은 Bool 게이팅/정수비로 선형화
     """
-    from pocat_classes import LDO, BuckConverter
 
     SCALE = 1_000_000
     max_sleep = constraints.get('max_sleep_current', 0.0)

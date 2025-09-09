@@ -8,7 +8,7 @@ from torchrl.data import UnboundedContinuousTensorSpec as Unbounded, \
     DiscreteTensorSpec as Categorical, \
     CompositeSpec as Composite
 
-from pocat_defs import (
+from common.pocat_defs import (
     NODE_TYPE_BATTERY, NODE_TYPE_IC, NODE_TYPE_LOAD,
     FEATURE_DIM, FEATURE_INDEX
 )
@@ -24,7 +24,7 @@ class PocatEnv(EnvBase):
         **kwargs,
     ):
         super().__init__(device=device)
-        from pocat_generator import PocatGenerator
+        from .pocat_generator import PocatGenerator
 
         self.generator = PocatGenerator(**generator_params)
         self.instance_repeats = instance_repeats

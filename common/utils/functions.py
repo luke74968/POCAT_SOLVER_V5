@@ -3,7 +3,7 @@
 import torch
 from torch import Tensor
 
-from utils.common import batchify, unbatchify, clip_grad_norms
+from .common import batchify, unbatchify, clip_grad_norms
 
 
 def gather_by_index(src: Tensor, idx: Tensor, dim: int = 1, squeeze: bool = True) -> Tensor:

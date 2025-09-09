@@ -9,8 +9,8 @@ import torch
 import logging
 import argparse
 
-from trainer import PocatTrainer
-from pocat_env import PocatEnv
+from .trainer import PocatTrainer
+from .pocat_env import PocatEnv
 
 def setup_logger(result_dir):
     log_file = os.path.join(result_dir, 'log.txt')

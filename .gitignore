@@ -19,3 +19,6 @@ __pycache__/
 
 #log.txt
 result/
+
+#zip
+*.7z

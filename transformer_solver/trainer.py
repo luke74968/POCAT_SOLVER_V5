@@ -1,11 +1,16 @@
 # trainer.py
 import torch
 from tqdm import tqdm
+import os
 
-from utils.common import TimeEstimator, clip_grad_norms, unbatchify
-from model import PocatModel
-from pocat_env import PocatEnv
+from common.utils.common import TimeEstimator, clip_grad_norms, unbatchify
+from .model import PocatModel
+from .pocat_env import PocatEnv
 import os # os 모듈 추가
+from common.pocat_visualizer import print_and_visualize_one_solution
+from common.pocat_classes import Battery, LDO, BuckConverter, Load
+
+
 
 
 def cal_model_size(model, log_func):
@@ -117,44 +122,73 @@ class PocatTrainer:
         """저장된 모델을 불러와 Power Tree를 생성하고 결과를 시각화합니다."""
         args = self.args
         args.log("==================== INFERENCE START ====================")
-        self.model.eval() # 모델을 평가 모드로 전환
+        self.model.eval()
 
-        # 💡 1. 평가할 문제 생성
-        # instance_repeats를 통해 동일한 문제를 여러 번 평가할 수 있습니다.
         td = self.env.reset(batch_size=1, instance_repeats=args.instance_repeats)
-        
-        # 💡 2. 모델로 Power Tree 생성
         out = self.model(td, self.env)
-        
-        # POMO 결과 중 가장 좋은 것 하나만 선택
+
         num_starts = self.env.generator.num_loads
-        reward = unbatchify(out["reward"], num_starts) # (1*L, 1) -> (1, L, 1)
-        actions = unbatchify(out["actions"], num_starts) # (1*L, S, 2) -> (1, L, S, 2)
-        
+        reward = unbatchify(out["reward"], num_starts)
+        actions = unbatchify(out["actions"], num_starts)
+
         best_reward, best_idx = reward.max(dim=1)
         best_action_sequence = actions[0, best_idx.item()]
         final_cost = -best_reward.item()
-        
+
         args.log(f"Generated Power Tree Cost: ${final_cost:.4f}")
         
-        # 💡 3. 결과 시각화
+        # 💡 2. 시각화 함수 호출
         self.visualize_result(best_action_sequence, final_cost)
 
     def visualize_result(self, actions, cost):
         """모델이 생성한 action_sequence를 기반으로 결과를 시각화합니다."""
-        # OR-Tools 프로젝트의 시각화 코드를 재활용할 수 있습니다.
-        # 여기서는 간단하게 연결 정보를 텍스트로 출력합니다.
-        node_names = self.env.generator.config.node_names
+        # 💡 3. visualizer가 요구하는 형태로 데이터 재구성
         
-        print("\n--- Generated Power Tree ---")
+        # config.json에서 원본 데이터 로드
+        config = self.env.generator.config
+        battery = Battery(**config.battery)
+        constraints = config.constraints
+        loads = [Load(**ld) for ld in config.loads]
+        
+        available_ics = []
+        for ic_data in config.available_ics:
+            ic_type = ic_data.pop('type')
+            if ic_type == 'LDO': available_ics.append(LDO(**ic_data))
+            elif ic_type == 'Buck': available_ics.append(BuckConverter(**ic_data))
+            ic_data['type'] = ic_type # pop 했던 것 복원
+
+        node_names = config.node_names
+        
         active_edges = []
+        used_ic_names = set()
         for action in actions:
             child_idx, parent_idx = action[0].item(), action[1].item()
             child_name = node_names[child_idx]
             parent_name = node_names[parent_idx]
+            
             active_edges.append((parent_name, child_name))
-            print(f"  {parent_name} -> {child_name}")
-        print("----------------------------")
+            
+            # 부모가 IC이면 used_ic_names에 추가
+            if config.node_types[parent_idx] == 1: # NODE_TYPE_IC
+                 used_ic_names.add(parent_name)
+
+        # OR-Tools의 솔루션과 동일한 dict 구조 생성
+        solution = {
+            "cost": cost,
+            "used_ic_names": used_ic_names,
+            "active_edges": active_edges
+        }
         
-        # TODO: OR-Tools 프로젝트의 pocat_visualizer.py와 연동하여
-        #       이미지 다이어그램을 생성하는 코드를 추가할 수 있습니다.
+        print("\n--- Generated Power Tree (Transformer) ---")
+        
+        # 💡 4. 공용 시각화 함수 호출!
+        # Transformer가 생성한 해는 이미 제약조건을 만족한다고 가정하므로,
+        # OR-Tools의 candidate_ics 대신 원본 available_ics를 전달하여 시각화
+        print_and_visualize_one_solution(
+            solution=solution, 
+            candidate_ics=available_ics, 
+            loads=loads, 
+            battery=battery, 
+            constraints=constraints, 
+            solution_index=1
+        )

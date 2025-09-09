@@ -1,6 +1,13 @@
 import torch
-from pocat_env import PocatEnv
-from pocat_defs import FEATURE_INDEX
+import sys
+import os 
+
+# 💡 테스트를 위해 프로젝트 루트 경로를 sys.path에 추가
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+
+from transformer_solver.pocat_env import PocatEnv
+from common.pocat_defs import FEATURE_INDEX
 
 
 def test_current_limit_mask():

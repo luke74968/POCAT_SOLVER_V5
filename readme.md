@@ -14,11 +14,11 @@ Set-ExecutionPolicy Bypass -Scope Process
 
 # 3. Code 실행
 # OR-TOOLS Solver 실행
-python main.py json 파일명
+python -m or_tools_solver.main config.json
 # Tronsformer based solver 학습 실행
-python run.py --config_file config.json --config_yaml config.yaml --batch_size 64
+python -m transformer_solver.run --config_file config.json --config_yaml config.yaml --batch_size 64
 # 학습된 결과로 Tronsformer based solver test 실행
-python run.py --test_only --load_path "result/2025-0905-171711/checkpoint-epoch-100.pth"
+python transformer_solver.run.py --test_only --load_path "result/..."
 
 
 

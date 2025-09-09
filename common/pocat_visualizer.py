@@ -1,7 +1,7 @@
 # pocat_visualizer.py
 from collections import defaultdict
 from graphviz import Digraph
-from pocat_classes import LDO, BuckConverter # 필요한 클래스 임포트
+from .pocat_classes import LDO, BuckConverter # 필요한 클래스 임포트
 
 def check_solution_validity(solution, candidate_ics, loads, battery, constraints):
     """주어진 해답이 모든 제약조건을 만족하는지 수동으로 검증하는 함수"""
@@ -166,7 +166,12 @@ def visualize_tree(solution, candidate_ics, loads, battery, constraints, junctio
     print(f"\n🖼️  Generating diagram for solution with cost ${solution['cost']:.2f}...")
     return dot
 
+
 def print_and_visualize_one_solution(solution, candidate_ics, loads, battery, constraints, solution_index=0):
+    """
+    하나의 솔루션을 콘솔에 출력하고, 다이어그램으로 시각화하여 저장합니다.
+    순환 참조가 있는 비정상적인 해답에 대한 무한 루프 방지 기능이 포함되어 있습니다.
+    """
     candidate_ics_map = {ic.name: ic for ic in candidate_ics}
     loads_map = {load.name: load for load in loads}
     print(f"\n{'='*20} 솔루션 (비용: ${solution['cost']:.2f}) {'='*20}")
@@ -188,13 +193,19 @@ def print_and_visualize_one_solution(solution, candidate_ics, loads, battery, co
                 always_on_nodes.add(parent)
                 nodes_to_process.append(parent)
 
+    # --- 무한 루프 방지 로직이 포함된 while문 ---
     while len(processed_ics) < len(used_ic_objects):
+        progress_made = False # 이번 루프에서 IC가 처리되었는지 확인하는 플래그
+        
         for ic in used_ic_objects:
-            if ic.name in processed_ics: continue
+            if ic.name in processed_ics: 
+                continue
+            
             children_names = [c for p, c in solution['active_edges'] if p == ic.name]
             
+            # 모든 자식 노드가 이미 처리되었거나 부하(load)일 경우에만 현재 IC를 처리
             if all(c in loads_map or c in processed_ics for c in children_names):
-                # Active current calculation (기존과 동일)
+                # Active current calculation
                 total_i_out_active = sum(actual_current_draw.get(c, 0) for c in children_names)
                 actual_i_outs[ic.name] = total_i_out_active
                 i_in_active = ic.calculate_input_current(vin=ic.vin, i_out=total_i_out_active)
@@ -204,14 +215,12 @@ def print_and_visualize_one_solution(solution, candidate_ics, loads, battery, co
                 ambient_temp = constraints.get('ambient_temperature', 25)
                 junction_temps[ic.name] = ambient_temp + (power_loss * ic.theta_ja)
                 
-                # --- [핵심 수정] Sleep current calculation ---
+                # Sleep current calculation
                 i_in_sleep = 0
                 parent_name = child_to_parent.get(ic.name)
-
-                # 1. Always-On 경로에 있는 IC일 경우
+                
                 if ic.name in always_on_nodes:
                     total_i_out_sleep = sum(sleep_current_draw.get(c, 0) for c in children_names)
-                    # Always-On 경로에서는 부하를 구동하므로 operating_current 사용
                     ic_self_consumption = ic.operating_current
                     
                     if isinstance(ic, LDO):
@@ -221,48 +230,65 @@ def print_and_visualize_one_solution(solution, candidate_ics, loads, battery, co
                             p_out_sleep = ic.vout * total_i_out_sleep
                             p_in_sleep = p_out_sleep / 0.8 if p_out_sleep > 0 else 0
                             i_in_sleep = (p_in_sleep / ic.vin) + ic_self_consumption
-
-                # 2. 일반(non-Always-On) 경로에 있으면서, 배터리에 직결된 IC일 경우
                 elif parent_name == battery.name:
-                    # 기능은 꺼지지만 입력 전원은 살아있으므로 quiescent_current만 소모
                     i_in_sleep = ic.quiescent_current
-
-                # 3. 일반 경로의 나머지 하위 IC들은 입력 전원이 차단되므로 i_in_sleep = 0
                 
                 actual_i_ins_sleep[ic.name] = i_in_sleep
                 sleep_current_draw[ic.name] = i_in_sleep
-                # --- 수정 끝 ---
 
                 processed_ics.add(ic.name)
+                progress_made = True # IC를 처리했음을 표시
+
+        # for 루프를 모두 순회했는데 아무 IC도 처리되지 않았다면 순환 구조로 인한 무한 루프 상태임
+        if not progress_made and len(used_ic_objects) > 0 :
+            print("\n⚠️ 경고: Power Tree에서 순환 참조가 발견되어 계산을 중단합니다.")
+            unprocessed_ics = [ic.name for ic in used_ic_objects if ic.name not in processed_ics]
+            if unprocessed_ics:
+                 print(f"         (미처리 IC: {unprocessed_ics})")
+            break  # while 루프 강제 탈출
+
+    # --- 이하 시각화 및 출력 로직 ---
     
     primary_ics = [c_name for p_name, c_name in solution['active_edges'] if p_name == battery.name]
     total_active_current = sum(actual_i_ins.get(ic_name, 0) for ic_name in primary_ics)
     total_sleep_current = sum(actual_i_ins_sleep.get(ic_name, 0) for ic_name in primary_ics)
     battery_avg_voltage = (battery.voltage_min + battery.voltage_max) / 2
     total_active_power = battery_avg_voltage * total_active_current
+    
     print(f"   - 시스템 전체 슬립 전류: {total_sleep_current * 1000:.4f} mA")
     print("\n--- Power Tree 구조 ---")
+    
     tree_topology = defaultdict(list)
-    for p, c in solution['active_edges']: tree_topology[p].append(c)
+    for p, c in solution['active_edges']: 
+        tree_topology[p].append(c)
+        
     def format_node_name(name, show_instance_num=False):
         if name in candidate_ics_map:
-            ic = candidate_ics_map[name]; base_name = f"📦 {ic.name.split('@')[0]} ({ic.vout:.1f}Vout)"
-            if show_instance_num and '_copy' in ic.name: return f"{base_name} [#{ic.name.split('_copy')[-1]}]"
+            ic = candidate_ics_map[name]
+            base_name = f"📦 {ic.name.split('@')[0]} ({ic.vout:.1f}Vout)"
+            if show_instance_num and '_copy' in ic.name: 
+                return f"{base_name} [#{ic.name.split('_copy')[-1]}]"
             return base_name
-        elif name in loads_map: return f"💡 {name}"
-        elif name == battery.name: return f"🔋 {name}"
+        elif name in loads_map: 
+            return f"💡 {name}"
+        elif name == battery.name: 
+            return f"🔋 {name}"
         return name
+        
     def print_instance_tree(parent_name, prefix=""):
         children = sorted(tree_topology.get(parent_name, []))
         for i, child_name in enumerate(children):
-            is_last = (i == len(children) - 1); connector = "└── " if is_last else "├── "
+            is_last = (i == len(children) - 1)
+            connector = "└── " if is_last else "├── "
             print(prefix + connector + format_node_name(child_name, show_instance_num=True))
             new_prefix = prefix + ("    " if is_last else "│   ")
             print_instance_tree(child_name, new_prefix)
+            
     print(format_node_name(battery.name))
     root_children = sorted(tree_topology.get(battery.name, []))
     for i, child_instance_name in enumerate(root_children):
-        is_last = (i == len(root_children) - 1); connector = "└── " if is_last else "├── "
+        is_last = (i == len(root_children) - 1)
+        connector = "└── " if is_last else "├── "
         print(connector + format_node_name(child_instance_name, show_instance_num=True))
         new_prefix = "    " if is_last else "│   "
         print_instance_tree(child_instance_name, new_prefix)
@@ -273,6 +299,9 @@ def print_and_visualize_one_solution(solution, candidate_ics, loads, battery, co
         total_active_power, total_active_current, total_sleep_current,
         always_on_nodes
     )
+    
     output_filename = f'solution_{solution_index}_cost_{solution["cost"]:.2f}'
-    dot_graph.render(output_filename, view=True, cleanup=True, format='png')
-    print(f"✅ 다이어그램을 '{output_filename}.png' 파일로 저장하고 실행했습니다.")
+    # view=False로 설정하여 이미지를 자동으로 띄우지 않도록 함
+    dot_graph.render(output_filename, view=False, cleanup=True, format='png')
+    
+    print(f"\n✅ 다이어그램을 '{output_filename}.png' 파일로 저장했습니다.")

@@ -4,7 +4,7 @@ import os
 import sys
 import shutil
 
-from utils.common import TimeEstimator
+from .common import TimeEstimator
 
 
 def copy_all_src(dst_root: str):

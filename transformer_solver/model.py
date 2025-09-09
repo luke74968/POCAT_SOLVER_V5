@@ -5,9 +5,9 @@ import torch.nn.functional as F
 from typing import Tuple
 from tensordict import TensorDict
 
-from pocat_defs import FEATURE_DIM
-from utils.common import batchify
-from pocat_env import PocatEnv
+from common.pocat_defs import FEATURE_DIM
+from common.utils.common import batchify
+from .pocat_env import PocatEnv
 
 # ... (RMSNorm, Normalization, EncoderLayer 등 다른 클래스는 이전과 동일) ...
 class RMSNorm(nn.Module):

@@ -5,14 +5,14 @@ import sys
 from dataclasses import asdict
 from ortools.sat.python import cp_model
 
-from pocat_core import (
+from .pocat_core import (
     load_configuration, expand_ic_instances, create_solver_model,
     find_all_load_distributions
 )
-from pocat_visualizer import (
+from common.pocat_visualizer import (
     check_solution_validity, print_and_visualize_one_solution
 )
-from pocat_preprocess import prune_dominated_ic_instances
+from .pocat_preprocess import prune_dominated_ic_instances
 
 def main():
     """메인 실행 함수"""
