@@ -106,28 +106,8 @@ class PocatDecoder(nn.Module):
     def __init__(self, embedding_dim: int, head_num: int = 8, **kwargs):
         super().__init__()
         self.embedding_dim = embedding_dim
-        self.child_wq, self.child_wk = nn.Linear(embedding_dim, embedding_dim, bias=False), nn.Linear(embedding_dim, embedding_dim, bias=False)
         self.parent_wq, self.parent_wk = nn.Linear(embedding_dim * 2, embedding_dim, bias=False), nn.Linear(embedding_dim, embedding_dim, bias=False)
 
-    def forward(self, encoded_nodes, context_embedding, mask):
-        child_q = self.child_wq(context_embedding).unsqueeze(1)
-        child_k = self.child_wk(encoded_nodes)
-        child_scores = torch.matmul(child_q, child_k.transpose(1, 2)).squeeze(1) / (self.embedding_dim ** 0.5)
-        child_scores[~mask.any(dim=2)] = -1e9
-        child_log_probs = F.log_softmax(child_scores, dim=-1)
-        selected_child_idx = child_log_probs.argmax(dim=-1)
-        child_emb = encoded_nodes[torch.arange(encoded_nodes.shape[0]), selected_child_idx]
-        parent_q_in = torch.cat([context_embedding, child_emb], dim=1)
-        parent_q = self.parent_wq(parent_q_in).unsqueeze(1)
-        parent_k = self.parent_wk(encoded_nodes)
-        parent_scores = torch.matmul(parent_q, parent_k.transpose(1, 2)).squeeze(1) / (self.embedding_dim ** 0.5)
-        parent_scores[~mask[torch.arange(mask.shape[0]), selected_child_idx]] = -1e9
-        parent_log_probs = F.log_softmax(parent_scores, dim=-1)
-        selected_parent_idx = parent_log_probs.argmax(dim=-1)
-        action = torch.stack([selected_child_idx, selected_parent_idx], dim=1)
-        child_prob = child_log_probs.gather(1, selected_child_idx.unsqueeze(-1)).squeeze(-1)
-        parent_prob = parent_log_probs.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
-        return child_prob + parent_prob, action
 
 class PocatModel(nn.Module):
     def __init__(self, **model_params):
@@ -137,6 +117,10 @@ class PocatModel(nn.Module):
         self.encoder = PocatEncoder(**model_params)
         self.decoder = PocatDecoder(**model_params)
         self.context_gru = nn.GRUCell(embedding_dim * 2, embedding_dim)
+        
+        # 💡 새 Load 선택을 위한 별도의 디코더 Query-Key 정의
+        self.load_select_wq = nn.Linear(embedding_dim, embedding_dim, bias=False)
+        self.load_select_wk = nn.Linear(embedding_dim, embedding_dim, bias=False)
 
     def forward(self, td: TensorDict, env: PocatEnv):
         prompt_embedding = self.prompt_net(td["prompt_features"])
@@ -147,51 +131,75 @@ class PocatModel(nn.Module):
         encoded_nodes = batchify(encoded_nodes, num_starts)
         
         batch_size = td.batch_size[0]
-        context_embedding = encoded_nodes.mean(dim=1)
+        context_embedding = encoded_nodes.mean(dim=1) # 초기 컨텍스트
         log_probs, actions = [], []
         
-        # POMO First Step
-        start_child_emb = encoded_nodes[torch.arange(batch_size), start_nodes_idx]
-        parent_q_in = torch.cat([context_embedding, start_child_emb], dim=1)
-        parent_q = self.decoder.parent_wq(parent_q_in).unsqueeze(1)
-        parent_k = self.decoder.parent_wk(encoded_nodes)
-        parent_scores = torch.matmul(parent_q, parent_k.transpose(1, 2)).squeeze(1) / (self.decoder.embedding_dim ** 0.5)
+        # --- 💡 1. Trajectory 기반 디코딩 루프 (while문) ---
         
-        mask = env.get_action_mask(td)
-        parent_scores[~mask[torch.arange(batch_size), start_nodes_idx]] = -1e9
-        parent_log_probs = F.log_softmax(parent_scores, dim=-1)
-        selected_parent_idx = parent_log_probs.argmax(dim=-1)
-        
-        action = torch.stack([start_nodes_idx, selected_parent_idx], dim=1)
+        # POMO의 첫 스텝: 시작 Load 선택
+        # 이 action은 아직 환경에 적용되지 않음 (다음 step에서 사용)
+        action = torch.stack([start_nodes_idx, torch.zeros_like(start_nodes_idx)], dim=1)
         td.set("action", action)
         
-        # 💡 수정된 부분: step()의 전체 반환값을 받고, 'next' 키로 다음 상태를 업데이트
         output_td = env.step(td)
         td = output_td["next"]
-        
-        log_prob = parent_log_probs.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
         actions.append(action)
-        log_probs.append(log_prob)
-        
-        parent_emb = encoded_nodes[torch.arange(batch_size), selected_parent_idx]
-        context_embedding = self.context_gru(torch.cat([start_child_emb, parent_emb], dim=1), context_embedding)
-        
-        # Decoding Loop
-        num_loads = env.generator.num_loads
-        for _ in range(1, num_loads):
-            if td["done"].all(): break
-            log_prob, action = self.decoder(encoded_nodes, context_embedding, env.get_action_mask(td))
+        # 첫 Load 선택은 확률 1로 간주 (로그 확률 0)
+        log_probs.append(torch.zeros(batch_size, device=td.device))
+
+        # 메인 디코딩 루프
+        while not td["done"].all():
+            mask = env.get_action_mask(td)
+            phase = td["decoding_phase"][0, 0].item()
+
+            if phase == 0:  # 새 Load 선택
+                # 컨텍스트: 메인 트리에 포함된 노드들의 평균 임베딩
+                main_tree_nodes = encoded_nodes * td["main_tree_mask"].unsqueeze(-1)
+                context_for_load_select = main_tree_nodes.sum(1) / (td["main_tree_mask"].sum(1, keepdim=True) + 1e-9)
+                
+                # 어텐션을 통해 다음 Load 선택
+                q = self.load_select_wq(context_for_load_select).unsqueeze(1)
+                k = self.load_select_wk(encoded_nodes)
+                scores = torch.matmul(q, k.transpose(1, 2)).squeeze(1) / (self.decoder.embedding_dim ** 0.5)
+                scores[~mask[:, :, 0].transpose(0, 1)] = -1e9 # 마스크 형태에 맞게 수정
+                
+                log_prob = F.log_softmax(scores, dim=-1)
+                selected_load = log_prob.argmax(dim=-1)
+                action = torch.stack([selected_load, torch.zeros_like(selected_load)], dim=1)
+                
+                log_prob_val = log_prob.gather(1, selected_load.unsqueeze(-1)).squeeze(-1)
+
+            elif phase == 1:  # Trajectory 구축
+                # 컨텍스트: 이전 컨텍스트 + 현재 경로 헤드 정보
+                # (GRU 업데이트는 아래 step 이후에 수행)
+                trajectory_head_idx = td["trajectory_head"].squeeze(-1)
+                head_emb = encoded_nodes[torch.arange(batch_size), trajectory_head_idx]
+                
+                # 부모 선택 (기존 디코더 로직 활용)
+                parent_q_in = torch.cat([context_embedding, head_emb], dim=1)
+                parent_q = self.decoder.parent_wq(parent_q_in).unsqueeze(1)
+                parent_k = self.decoder.parent_wk(encoded_nodes)
+                parent_scores = torch.matmul(parent_q, parent_k.transpose(1, 2)).squeeze(1) / (self.decoder.embedding_dim ** 0.5)
+                parent_scores[~mask[torch.arange(batch_size), trajectory_head_idx]] = -1e9
+                
+                parent_log_probs = F.log_softmax(parent_scores, dim=-1)
+                selected_parent_idx = parent_log_probs.argmax(dim=-1)
+                
+                action = torch.stack([trajectory_head_idx, selected_parent_idx], dim=1)
+                log_prob_val = parent_log_probs.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
+
             td.set("action", action)
             output_td = env.step(td)
             td = output_td["next"]
-            actions.append(action)
-            log_probs.append(log_prob)
             
+            actions.append(action)
+            log_probs.append(log_prob_val)
+            
+            # --- 컨텍스트 업데이트 (GRU) ---
             child_emb = encoded_nodes[torch.arange(batch_size), action[:, 0]]
             parent_emb = encoded_nodes[torch.arange(batch_size), action[:, 1]]
             context_embedding = self.context_gru(torch.cat([child_emb, parent_emb], dim=1), context_embedding)
-
-        # 💡 수정된 부분: 최종 상태의 보상이 아닌, 마지막 step에서 반환된 보상을 사용
+            
         final_reward = output_td["reward"]
 
         return {

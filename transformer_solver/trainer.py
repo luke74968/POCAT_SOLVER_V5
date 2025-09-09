@@ -93,23 +93,31 @@ class PocatTrainer:
                 out = self.model(td, self.env)
                 
                 num_starts = self.env.generator.num_loads
-                reward = unbatchify(out["reward"], num_starts)
-                log_likelihood = unbatchify(out["log_likelihood"], num_starts)
+                # reward와 log_likelihood를 (탐색 횟수, 배치 크기) 형태로 변경합니다.
+                reward = out["reward"].view(num_starts, -1)
+                log_likelihood = out["log_likelihood"].view(num_starts, -1)
                 
-                best_reward, best_idx = reward.max(dim=1)
-                advantage = best_reward - reward.mean(dim=1)
-                best_log_likelihood = log_likelihood.gather(1, best_idx).squeeze(-1)
+                # [핵심 수정] 
+                # 1. 평균 보상을 기준으로 advantage를 계산합니다.
+                #    이제 모든 탐색 결과가 자신의 보상과 전체 평균을 비교하게 됩니다.
+                advantage = reward - reward.mean(dim=0, keepdims=True)
                 
-                loss = -(advantage * best_log_likelihood).mean()
+                # 2. advantage와 모든 log_likelihood를 사용하여 손실을 계산합니다.
+                #    'best'가 아닌 모든 결과를 학습에 반영합니다.
+                loss = -(advantage * log_likelihood).mean()
+
                 loss.backward()
+
+                
                 clip_grad_norms(self.optimizer.param_groups, 1.0)
                 self.optimizer.step()
                 
+                best_reward, _ = reward.max(dim=0) # dim=0으로 수정 (탐색 결과 중 최고)
                 current_cost = -best_reward.mean().item()
+
                 total_loss += loss.item()
                 total_cost += current_cost
                 
-                # 💡 2. tqdm.set_postfix를 사용하여 실시간 정보를 보기 좋게 표시합니다.
                 train_pbar.set_postfix({
                     'Loss': f'{total_loss/step:.4f}',
                     'Cost': f'${total_cost/step:.2f}'
