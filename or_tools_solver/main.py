@@ -13,7 +13,7 @@ from .pocat_core import (
 from common.pocat_visualizer import (
     check_solution_validity, print_and_visualize_one_solution
 )
-from .pocat_preprocess import prune_dominated_ic_instances
+from common.pocat_preprocess import prune_dominated_ic_instances
 # 💡 2. 새로운 공용 로더에서 함수를 가져옵니다.
 from common.config_loader import load_configuration_from_file
 

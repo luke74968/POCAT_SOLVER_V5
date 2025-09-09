@@ -3,8 +3,10 @@ import json
 import torch
 from tensordict import TensorDict
 import copy # 💡 deepcopy를 위해 import
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 
+from dataclasses import asdict
+from common.pocat_preprocess import prune_dominated_ic_instances
 from common.pocat_classes import PowerIC, LDO, BuckConverter, Load, Battery
 from common.pocat_defs import (
     PocatConfig, NODE_TYPE_BATTERY, NODE_TYPE_IC, NODE_TYPE_LOAD,
@@ -32,7 +34,7 @@ def calculate_derated_current_limit(ic: PowerIC, constraints: Dict[str, Any]) ->
     elif isinstance(ic, BuckConverter):
         low, high = 0.0, ic.i_limit
         i_limit_based_temp = 0.0
-        for _ in range(50): # 50번의 이진 탐색으로 충분한 정밀도 확보
+        for _ in range(50):
             mid = (low + high) / 2
             if mid < 1e-6: break
             power_loss_at_mid = ic.calculate_power_loss(ic.vin, mid)
@@ -44,82 +46,104 @@ def calculate_derated_current_limit(ic: PowerIC, constraints: Dict[str, Any]) ->
                 
     return min(ic.i_limit, i_limit_based_temp)
 
-class PocatGenerator:
+def expand_ic_instances(available_ics: List[PowerIC], loads: List[Load], battery: Battery, constraints: Dict[str, Any]) -> List[PowerIC]:
     """
-    pocat_solver의 config.json 파일을 읽고, IC를 동적으로 복제한 뒤,
-    Transformer 모델 학습에 필요한 TensorDict 형태의 데이터를 생성합니다.
+    모든 유효한 Vin/Vout 조합에 대해 IC 인스턴스를 확장하고 복제합니다.
     """
-    def __init__(self, config_file_path: str):
-        with open(config_file_path, "r") as f:
-            config_data = json.load(f)
-        
-        original_config = PocatConfig(**config_data)
-        
-        # --- 💡 1. OR-Tools처럼 IC 인스턴스를 동적으로 복제 ---
-        num_loads_count = len(original_config.loads)
-        expanded_ics = []
-        original_ics = original_config.available_ics
-        
-        for ic_template in original_ics:
-            # 원본 IC는 그대로 추가
-            expanded_ics.append(ic_template)
-            # (부하의 개수 - 1) 만큼 복제본 생성
-            for i in range(1, num_loads_count):
-                ic_copy = copy.deepcopy(ic_template)
-                ic_copy['name'] = f"{ic_template['name']}_copy{i}"
-                expanded_ics.append(ic_copy)
+    potential_vout = sorted(list(set(load.voltage_typical for load in loads)))
+    battery.vout = (battery.voltage_min + battery.voltage_max) / 2
+    potential_vin = sorted(list(set([battery.vout] + potential_vout)))
+    candidate_ics = []
+    
+    for template_ic in available_ics:
+        for vin in potential_vin:
+            for vout in potential_vout:
+                if not (template_ic.vin_min <= vin <= template_ic.vin_max and 
+                        template_ic.vout_min <= vout <= template_ic.vout_max):
+                    continue
+                
+                if isinstance(template_ic, LDO) and vin < (vout + template_ic.v_dropout):
+                    continue
+                if isinstance(template_ic, BuckConverter) and vin <= vout:
+                    continue
+                
+                num_potential_loads = sum(1 for load in loads if load.voltage_typical == vout)
+                group_key = f"{template_ic.name}@{vin:.1f}Vin_{vout:.1f}Vout"
+                
+                for i in range(num_potential_loads):
+                    concrete_ic = copy.deepcopy(template_ic)
+                    concrete_ic.vin, concrete_ic.vout = vin, vout
+                    concrete_ic.name = f"{group_key}_copy{i+1}"
+                    
+                    concrete_ic.original_i_limit = template_ic.i_limit
+                    derated_limit = calculate_derated_current_limit(concrete_ic, constraints)
+                    
+                    if derated_limit > 0:
+                        concrete_ic.i_limit = derated_limit
+                        candidate_ics.append(concrete_ic)
 
-        print(f"✅ 동적 복제 완료: {len(original_ics)}개의 원본 IC -> {len(expanded_ics)}개의 사용 가능 인스턴스")
+    return candidate_ics
+
+
+class PocatGenerator:
+    def __init__(self, config_file_path: str):
+        with open(config_file_path, "r", encoding='utf-8') as f:
+            config_data = json.load(f)
+
+        # --- 💡 2. 지능적인 인스턴스 확장 로직 실행 ---
+        # 먼저 설정 파일로부터 원본 객체들을 생성
+        battery_obj = Battery(**config_data['battery'])
+        loads_obj = [Load(**ld) for ld in config_data['loads']]
         
-        # 복제된 IC 목록으로 config 객체 재생성
-        config_data['available_ics'] = expanded_ics
-        self.config = PocatConfig(**config_data)
+        original_ics_obj = []
+        for ic_data in config_data['available_ics']:
+            ic_type = ic_data.get('type')
+            if ic_type == 'LDO': original_ics_obj.append(LDO(**ic_data))
+            elif ic_type == 'Buck': original_ics_obj.append(BuckConverter(**ic_data))
+        
+        # 1. 지능적 확장
+        candidate_ic_objs = expand_ic_instances(original_ics_obj, loads_obj, battery_obj, config_data['constraints'])
+
+        # --- 💡 2. Dominance Pruning 적용 ---     
+        # 객체 리스트를 다시 dict 리스트로 변환
+        candidate_ics_dicts = [asdict(ic) for ic in candidate_ic_objs]
+        pruned_ics_dicts, _ = prune_dominated_ic_instances(candidate_ics_dicts)
+        
+        print(f"✅ 지능적 확장 완료: {len(original_ics_obj)}개 원본 IC -> {len(candidate_ic_objs)}개 특화 인스턴스")
+        print(f"🔪 Dominance Pruning 완료: {len(candidate_ic_objs)}개 -> {len(pruned_ics_dicts)}개 최종 인스턴스")
         # --- 수정 완료 ---
+        
+        config_data['available_ics'] = pruned_ics_dicts # Pruning된 최종 목록 사용
+        self.config = PocatConfig(**config_data)
         
         self.num_nodes = len(self.config.node_names)
         self.num_loads = len(self.config.loads)
 
+
     def _create_feature_tensor(self) -> torch.Tensor:
         features = torch.zeros(self.num_nodes, FEATURE_DIM)
         
-        # --- 💡 2. 열 마진 계산을 위해 객체를 미리 생성합니다. ---
-        battery_obj = Battery(**self.config.battery)
-        loads_obj = [Load(**ld) for ld in self.config.loads]
-        
-        # Battery Features
         battery_conf = self.config.battery
         features[0, FEATURE_INDEX["node_type"][0] + NODE_TYPE_BATTERY] = 1.0
         features[0, FEATURE_INDEX["vout_min"]] = battery_conf["voltage_min"]
         features[0, FEATURE_INDEX["vout_max"]] = battery_conf["voltage_max"]
 
-        # IC Features
+        # --- 💡 3. 확장된 '특화' 인스턴스 정보로 피처 생성 ---
         start_idx = 1
         for i, ic_conf in enumerate(self.config.available_ics):
             idx = start_idx + i
             features[idx, FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] = 1.0
             features[idx, FEATURE_INDEX["cost"]] = ic_conf.get("cost", 0.0)
-            features[idx, FEATURE_INDEX["vin_min"]] = ic_conf.get("vin_min", 0.0)
-            features[idx, FEATURE_INDEX["vin_max"]] = ic_conf.get("vin_max", 100.0)
-            features[idx, FEATURE_INDEX["vout_min"]] = ic_conf.get("vout_min", 0.0)
-            features[idx, FEATURE_INDEX["vout_max"]] = ic_conf.get("vout_max", 100.0)
             
-            # --- 💡 3. 열 마진이 적용된 전류 한계로 교체 ---
-            # 가상 IC 객체를 만들어 계산에 활용 (vin, vout은 대표값 사용)
-            ic_type = ic_conf.get('type')
-            temp_ic_obj = None
-            if ic_type == 'LDO': temp_ic_obj = LDO(**ic_conf)
-            elif ic_type == 'Buck': temp_ic_obj = BuckConverter(**ic_conf)
+            # 특화된 vin, vout 값을 피처로 사용 (이제 범위가 아닌 고정값)
+            features[idx, FEATURE_INDEX["vin_min"]] = ic_conf.get("vin", 0.0)
+            features[idx, FEATURE_INDEX["vin_max"]] = ic_conf.get("vin", 0.0)
+            features[idx, FEATURE_INDEX["vout_min"]] = ic_conf.get("vout", 0.0)
+            features[idx, FEATURE_INDEX["vout_max"]] = ic_conf.get("vout", 0.0)
             
-            if temp_ic_obj:
-                temp_ic_obj.vin = (temp_ic_obj.vin_min + temp_ic_obj.vin_max) / 2
-                temp_ic_obj.vout = (temp_ic_obj.vout_min + temp_ic_obj.vout_max) / 2
-                derated_limit = calculate_derated_current_limit(temp_ic_obj, self.config.constraints)
-                features[idx, FEATURE_INDEX["i_limit"]] = derated_limit
-            else:
-                features[idx, FEATURE_INDEX["i_limit"]] = ic_conf.get("i_limit", 0.0)
-            # --- 수정 끝 ---
+            # 열 마진이 적용된 i_limit
+            features[idx, FEATURE_INDEX["i_limit"]] = ic_conf.get("i_limit", 0.0)
 
-        # Load Features
         start_idx += len(self.config.available_ics)
         for i, load_conf in enumerate(self.config.loads):
             idx = start_idx + i
@@ -130,7 +154,9 @@ class PocatGenerator:
             features[idx, FEATURE_INDEX["current_sleep"]] = load_conf["current_sleep"]
 
         return features
-    def __call__(self, batch_size: int, instance_repeats: int = 1) -> TensorDict:
+
+    def __call__(self, batch_size: int, **kwargs) -> TensorDict:
+        # __call__ 메소드는 instance_repeats를 사용하지 않도록 수정
         node_features = self._create_feature_tensor()
         constraints = self.config.constraints
         prompt_features = torch.tensor(
@@ -139,19 +165,10 @@ class PocatGenerator:
                 constraints.get("max_sleep_current", 0.0),
             ]
         )
-
-        # Expand along batch dimension and create repeated clones
         node_features = node_features.unsqueeze(0).expand(batch_size, -1, -1)
         prompt_features = prompt_features.unsqueeze(0).expand(batch_size, -1)
         
-        node_features = node_features.unsqueeze(1).expand(batch_size, instance_repeats, -1, -1)
-        prompt_features = prompt_features.unsqueeze(1).expand(batch_size, instance_repeats, -1)
-
-        # 💡 수정된 부분: static_info를 TensorDict에서 제거
         return TensorDict(
-            {
-                "nodes": node_features,
-                "prompt_features": prompt_features,
-            },
-            batch_size=[batch_size, instance_repeats],
+            { "nodes": node_features, "prompt_features": prompt_features, },
+            batch_size=[batch_size],
         )
