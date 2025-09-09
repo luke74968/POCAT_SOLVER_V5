@@ -13,6 +13,7 @@ from common.pocat_defs import (
     FEATURE_DIM, FEATURE_INDEX
 )
 
+
 class PocatEnv(EnvBase):
     name = "pocat"
 
@@ -31,7 +32,7 @@ class PocatEnv(EnvBase):
             
         num_nodes = td["nodes"].shape[1]
         batch_size = td.batch_size[0]
-
+        
         # --- 💡 1. Trajectory 기반 상태(state) 재정의 ---
         reset_td = TensorDict({
             "nodes": td["nodes"],
@@ -83,26 +84,30 @@ class PocatEnv(EnvBase):
             child_idx, parent_idx = action[:, 0], action[:, 1]
             next_obs["adj_matrix"][b_idx, parent_idx, child_idx] = True
             
-            # 전류 전파 로직 (기존과 유사)
-            # ...
+            # [수정] 전류 전파 로직 구현
+            path_nodes_mask = self._trace_path_batch(b_idx, child_idx, next_obs["adj_matrix"])
+            path_nodes_currents = (td["nodes"] * path_nodes_mask.unsqueeze(-1))[:, :, FEATURE_INDEX["current_active"]]
             
+            for i in range(td.batch_size[0]):
+                total_child_current = path_nodes_currents[i].sum()
+                ancestor = parent_idx[i].item()
+                while ancestor != 0:
+                    next_obs["ic_current_draw"][i, ancestor] += total_child_current
+                    ancestors_of_ancestor = next_obs["adj_matrix"][i, :, ancestor].nonzero(as_tuple=True)[0]
+                    if ancestors_of_ancestor.numel() == 0: break
+                    ancestor = ancestors_of_ancestor[0].item()
+
             is_parent_in_main_tree = next_obs["main_tree_mask"][b_idx, parent_idx]
             
             for i in range(td.batch_size[0]):
                 if is_parent_in_main_tree[i]:
-                    # 경로가 메인 트리에 연결됨 -> Trajectory 완성
-                    # 완성된 경로의 모든 노드를 메인 트리에 편입
-                    path_nodes = self._trace_path(i, child_idx[i], next_obs["adj_matrix"])
-                    next_obs["main_tree_mask"][i, path_nodes] = True
-                    
+                    path_nodes_indices = self._trace_path(i, child_idx[i], next_obs["adj_matrix"])
+                    next_obs["main_tree_mask"][i, path_nodes_indices] = True
                     if next_obs["unconnected_loads_mask"][i].sum() == 0:
-                        # 모든 Load가 연결되었으면 종료
                         next_obs["done"][i] = True
                     else:
-                        # 아니면 다음 Load 선택 단계로
                         next_obs["decoding_phase"][i] = 0
                 else:
-                    # 아직 경로 구축 중 -> 경로 헤드만 업데이트
                     next_obs["trajectory_head"][i] = parent_idx[i]
 
         next_obs.set("step_count", td["step_count"] + 1)
@@ -128,95 +133,69 @@ class PocatEnv(EnvBase):
             # 자식: 현재 Trajectory의 헤드 노드만 가능
             child_indices = td["trajectory_head"].squeeze(-1)
             b_idx = torch.arange(batch_size, device=self.device)
-            
-            can_be_parent = torch.ones(batch_size, num_nodes, dtype=torch.bool, device=self.device)
-            # 자기 자신, 이미 경로에 포함된 노드는 부모가 될 수 없음
+
+            # [1번 조건] "자기 자신"은 부모가 될 수 없음
             can_be_parent[b_idx, child_indices] = False
-            
+
+            # 현재까지 만들어진 경로상의 모든 노드를 추적
             path_nodes = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"])
+
+            # [2번 조건] "이미 경로에 포함된 노드"는 부모가 될 수 없음
             can_be_parent[path_nodes] = False
 
-            # --- 기본 마스크 (전압, 전류, 기본 연결 규칙) ---
-            node_types = td["nodes"][0, :, :FEATURE_INDEX["node_type"][1]].argmax(-1)
-            is_load = node_types == NODE_TYPE_LOAD
-            is_ic = node_types == NODE_TYPE_IC
-            is_battery = node_types == NODE_TYPE_BATTERY
+            # 1. 전압 호환성
+            head_node_vin_min = td["nodes"][b_idx, child_indices, FEATURE_INDEX["vin_min"]]
+            parent_vout_max = td["nodes"][:, :, FEATURE_INDEX["vout_max"]]
+            can_be_parent &= (parent_vout_max >= head_node_vin_min.unsqueeze(1))
             
-            can_be_child = ~td["connected_nodes_mask"] & (is_ic | is_load)
-            can_be_parent = td["connected_nodes_mask"] & (is_ic | is_battery)
-            
-            base_mask = can_be_child.unsqueeze(1) & can_be_parent.unsqueeze(2)
-            base_mask[:, torch.arange(num_nodes), torch.arange(num_nodes)] = False # 자기 자신에게 연결 금지
-
-            # 전압 호환성
-            parent_vout_max = td["nodes"][:, :, FEATURE_INDEX["vout_max"]].unsqueeze(2)
-            child_vin_min = td["nodes"][:, :, FEATURE_INDEX["vin_min"]].unsqueeze(1)
-            base_mask &= (parent_vout_max >= child_vin_min)
-
-            # 전류 한계 (이제 열 마진이 반영된 i_limit 사용)
-            child_currents = td["nodes"][:, :, FEATURE_INDEX["current_active"]].unsqueeze(1)
-            prospective_draw = td["ic_current_draw"].unsqueeze(2) + child_currents
-            parent_limits = td["nodes"][:, :, FEATURE_INDEX["i_limit"]].unsqueeze(2)
-            # i_limit=0인 노드(부하, 배터리)는 무한대로 처리하여 전류 검사 통과
+            # 2. 전류 한계
+            path_nodes_currents = (td["nodes"][:, :, FEATURE_INDEX["current_active"]] * current_path_mask).sum(dim=1)
+            prospective_draw = td["ic_current_draw"] + path_nodes_currents.unsqueeze(1)
+            parent_limits = td["nodes"][:, :, FEATURE_INDEX["i_limit"]]
             inf_limits = torch.where(parent_limits > 0, parent_limits, float("inf"))
-            base_mask &= (prospective_draw.transpose(1, 2) <= inf_limits)
+            can_be_parent &= (prospective_draw <= inf_limits)
 
-            # --- 💡 3. 복잡한 전역 제약조건 마스킹 ---
-            final_mask = base_mask
-            
-            # config.json의 제약조건 파싱
+            # 3. 전역 제약조건 (Independent Rail, Power Sequence)
             constraints = self.generator.config.constraints
             loads_info = self.generator.config.loads
-            load_map = {l['name']: l for l in loads_info}
             node_names = self.generator.config.node_names
             
-            # 조상(ancestor) 행렬 계산: 플로이드-워셜 알고리즘과 유사
+            # 조상(ancestor) 행렬 계산: 현재 메인 트리에 대해서만 계산
             ancestors = td["adj_matrix"].clone()
             for k in range(num_nodes):
                 for i in range(num_nodes):
                     for j in range(num_nodes):
                         ancestors[:, i, j] |= ancestors[:, i, k] & ancestors[:, k, j]
-
-            # 1. 독립 레일 (Independent Rail)
-            for i, load in enumerate(loads_info):
-                rail_type = load.get("independent_rail_type")
-                if not rail_type: continue
-                
-                load_idx = self.generator.num_nodes - self.generator.num_loads + i
-                
-                if rail_type == 'exclusive_supplier':
-                    # 이 부하(load_idx)를 자식으로 가지려는 부모(p)는 다른 자식이 있으면 안 됨
-                    # 즉, adj_matrix[p]의 out-degree가 0이어야 함
-                    num_children = td["adj_matrix"].sum(dim=2) # (B, N)
-                    is_ok_parent = (num_children == 0)
-                    final_mask[:, :, load_idx] &= is_ok_parent
-
-                elif rail_type == 'exclusive_path':
-                    # 이 부하의 조상들은 다른 자식을 가질 수 없음
-                    load_ancestors = ancestors[:, :, load_idx] # (B, N)
-                    num_children = td["adj_matrix"].sum(dim=2)
-                    # 조상이면서 자식이 1개 초과인 노드 찾기 (배터리 제외)
-                    violating_ancestors = load_ancestors & (num_children > 1) & is_ic.unsqueeze(0)
-                    # 위반하는 조상을 부모로 삼으려는 모든 연결을 금지
-                    final_mask &= ~violating_ancestors.unsqueeze(2)
-
-            # 2. 전원 인가 순서 (Power Sequence)
+            
+            # 3a. Independent Rail
+            head_load_idx = child_indices - (1 + len(self.generator.config.available_ics))
+            for b in range(batch_size):
+                if 0 <= head_load_idx[b] < len(loads_info):
+                    load = loads_info[head_load_idx[b]]
+                    rail_type = load.get("independent_rail_type")
+                    if rail_type == 'exclusive_supplier':
+                        num_children = td["adj_matrix"][b].sum(dim=1)
+                        can_be_parent[b] &= (num_children == 0)
+                    elif rail_type == 'exclusive_path':
+                        # 경로에 속할 모든 잠재적 부모들이 다른 자식을 가지면 안됨
+                        num_children = td["adj_matrix"][b].sum(dim=1)
+                        can_be_parent[b] &= (num_children <= 1)
+            
+            # 3b. Power Sequence
             for seq in constraints.get("power_sequences", []):
+                if seq.get('f') != 1: continue
                 j_name, k_name = seq['j'], seq['k']
                 if j_name not in node_names or k_name not in node_names: continue
                 j_idx, k_idx = node_names.index(j_name), node_names.index(k_name)
+                
+                # 현재 head가 k_idx인 경우, j의 조상이 될 수 있는 노드는 부모가 될 수 없음
+                is_head_k = (child_indices == k_idx)
+                if is_head_k.any():
+                     j_ancestors = ancestors[is_head_k, :, j_idx]
+                     can_be_parent[is_head_k] &= ~j_ancestors
 
-                # k의 부모(p)는 j의 조상이 될 수 없음
-                j_ancestors = ancestors[:, :, j_idx] # (B, N)
-                final_mask[:, :, k_idx] &= ~j_ancestors
-
-                # j와 k는 같은 부모를 가질 수 없음
-                is_k_parent_mask = td["adj_matrix"][:, :, k_idx]  # (B, N) 모양의 불리언 마스크
-                # final_mask에서 자식이 j_idx인 슬라이스 (B, N)를 선택한 뒤,
-                # k의 부모인 위치에 False를 적용합니다.
-                final_mask[:, :, j_idx][is_k_parent_mask] = False
-
-        return final_mask
+            mask[b_idx, :, child_indices] = can_be_parent
+            return mask
     
     def get_reward(self, td: TensorDict, done: torch.Tensor) -> torch.Tensor:
         reward = torch.zeros(td.batch_size[0], device=self.device)
@@ -248,14 +227,16 @@ class PocatEnv(EnvBase):
         return reward.unsqueeze(-1)
         
     def _make_spec(self):
-        # ... (기존과 동일, 단 instance_repeats 제거) ...
         num_nodes = self.generator.num_nodes
         self.observation_spec = Composite({
             "nodes": Unbounded(shape=(num_nodes, FEATURE_DIM)),
             "prompt_features": Unbounded(shape=(2,)),
             "adj_matrix": Categorical(n=2, shape=(num_nodes, num_nodes), dtype=torch.bool),
-            "connected_nodes_mask": Categorical(n=2, shape=(num_nodes,), dtype=torch.bool),
+            "main_tree_mask": Categorical(n=2, shape=(num_nodes,), dtype=torch.bool),
             "ic_current_draw": Unbounded(shape=(num_nodes,)),
+            "decoding_phase": UnboundedDiscrete(shape=(1,), dtype=torch.long),
+            "trajectory_head": UnboundedDiscrete(shape=(1,), dtype=torch.long),
+            "unconnected_loads_mask": Categorical(n=2, shape=(num_nodes,), dtype=torch.bool),
             "step_count": UnboundedDiscrete(shape=(1,), dtype=torch.long),
         })
         self.action_spec = UnboundedDiscrete(shape=(2,), dtype=torch.long)
@@ -293,11 +274,18 @@ class PocatEnv(EnvBase):
         path_mask[b_idx, head_indices] = True
         
         current_heads = head_indices
-        for _ in range(num_nodes): # 무한루프 방지
-            # 행렬 곱셈을 이용한 효율적인 부모 노드 탐색
-            adj_T = adj_matrix.transpose(1, 2)
-            parents = torch.where(adj_T[b_idx, current_heads])[1]
-            if parents.numel() == 0: break
-            path_mask[b_idx, parents] = True
+        for _ in range(num_nodes):
+            # 각 배치 샘플마다 current_heads에 해당하는 부모를 찾음
+            # adj_matrix[:, :, current_heads] -> (B, N, B) -> 대각선만 필요
+            parents_connections = adj_matrix[b_idx, :, current_heads] # (B, N)
+            
+            has_parent = parents_connections.any(dim=1)
+            if not has_parent.any(): break
+            
+            # 각 배치의 부모 인덱스를 찾음 (하나의 부모만 있다고 가정)
+            parents = parents_connections.argmax(dim=1)
+            
+            path_mask[b_idx[has_parent], parents[has_parent]] = True
             current_heads = parents
+            
         return path_mask
