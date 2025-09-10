@@ -22,7 +22,119 @@ class PocatEnv(EnvBase):
         from .pocat_generator import PocatGenerator
         self.generator = PocatGenerator(**generator_params)
         self._make_spec()
-        self._set_seed(None)
+        self._set_seed(None) # 생성자에서 호출은 되어 있으나, 아래에 메소드 정의가 필요합니다.
+
+    # --- 👇 1. 누락된 _make_spec 메소드 추가 ---
+    def _make_spec(self):
+        """환경의 observation, action, reward 스펙을 정의합니다."""
+        num_nodes = self.generator.num_nodes
+        
+        # 관측 공간(Observation Space) 정의
+        self.observation_spec = Composite({
+            "nodes": Unbounded(
+                shape=(num_nodes, FEATURE_DIM),
+                dtype=torch.float32,
+            ),
+            "prompt_features": Unbounded(
+                shape=(5,), # ambient_temp, max_sleep_current, current_margin, thermal_margin_percent, power_sequence_count
+                dtype=torch.float32,
+            ),
+            "adj_matrix": Unbounded(
+                shape=(num_nodes, num_nodes),
+                dtype=torch.bool,
+            ),
+            "main_tree_mask": Unbounded(
+                shape=(num_nodes,),
+                dtype=torch.bool,
+            ),
+            "ic_current_draw": Unbounded(
+                shape=(num_nodes,),
+                dtype=torch.float32,
+            ),
+            "decoding_phase": Categorical(
+                shape=(1,),
+                n=2, # 0: 새 Load 선택, 1: Trajectory 구축
+                dtype=torch.long,
+            ),
+            "trajectory_head": UnboundedDiscrete(
+                shape=(1,),
+                dtype=torch.long,
+            ),
+            "unconnected_loads_mask": Unbounded(
+                shape=(num_nodes,),
+                dtype=torch.bool,
+            ),
+            "step_count": UnboundedDiscrete(
+                shape=(1,),
+                dtype=torch.long,
+            ),
+        })
+        
+        # 행동 공간(Action Space) 정의: [자식 노드, 부모 노드]
+        self.action_spec = UnboundedDiscrete(
+            shape=(2,),
+            dtype=torch.long,
+        )
+        
+        # 보상(Reward) 스펙 정의
+        self.reward_spec = Unbounded(shape=(1,))
+
+    # --- 👇 2. 누락된 _set_seed 메소드 추가 ---
+    def _set_seed(self, seed: Optional[int] = None):
+        """환경의 랜덤 시드를 설정합니다. (torchrl 필수 구현)"""
+        # 현재 환경은 자체적인 랜덤 요소가 없으므로 특별한 로직은 필요 없습니다.
+        # 하지만 EnvBase를 상속받기 위해 반드시 구현해야 합니다.
+        if seed is not None:
+            torch.manual_seed(seed)
+
+    # --- 👇 1. 누락되었던 select_start_nodes 메소드 추가 ---
+    def select_start_nodes(self, td: TensorDict) -> Tuple[int, torch.Tensor]:
+        """POMO decoding을 위해 시작 노드(모든 Load)를 선택합니다."""
+        # 노드 타입 정보는 배치 내에서 동일하므로 0번 인덱스만 사용합니다.
+        node_types = td["nodes"][0, :, :FEATURE_INDEX["node_type"][1]].argmax(-1)
+        start_nodes_idx = torch.where(node_types == NODE_TYPE_LOAD)[0]
+        num_starts = len(start_nodes_idx)
+        return num_starts, start_nodes_idx
+
+    # --- 👇 2. 누락되었던 경로 추적 헬퍼 메소드들 추가 ---
+    def _trace_path(self, b_idx: int, start_node: int, adj_matrix: torch.Tensor) -> list[int]:
+        """단일 배치 항목에 대해 start_node에서 시작하는 경로를 역추적하여 노드 인덱스 리스트를 반환합니다."""
+        path = [start_node]
+        current_node = start_node
+        # adj_matrix[b_idx, parent, child] 형태이므로, current_node를 자식으로 갖는 부모를 찾습니다.
+        while True:
+            parents = adj_matrix[b_idx, :, current_node].nonzero(as_tuple=True)[0]
+            if parents.numel() == 0:
+                break
+            parent_node = parents[0].item() # 경로는 하나뿐이라고 가정
+            path.append(parent_node)
+            current_node = parent_node
+        return path
+
+    def _trace_path_batch(self, b_idx: torch.Tensor, start_nodes: torch.Tensor, adj_matrix: torch.Tensor) -> torch.Tensor:
+        """배치 전체에 대해 start_node들의 모든 조상을 찾아 마스크로 반환합니다."""
+        num_nodes = adj_matrix.shape[-1]
+        
+        # 선택된 배치 항목들에 대한 인접 행렬
+        adj_b = adj_matrix[b_idx]
+        
+        # 경로 마스크 초기화 (시작 노드만 True)
+        path_mask = torch.zeros(len(b_idx), num_nodes, dtype=torch.bool, device=self.device)
+        path_mask[torch.arange(len(b_idx)), start_nodes] = True
+        
+        # 행렬 곱셈을 이용해 그래프를 거슬러 올라가며 모든 조상을 찾습니다.
+        for _ in range(num_nodes):
+            # 현재 경로에 포함된 노드들의 부모를 찾습니다.
+            parents_mask = (adj_b.float() @ path_mask.float().unsqueeze(-1)).squeeze(-1) > 0
+            
+            # 더 이상 새로운 부모가 없으면 (경로의 끝에 도달하면) 종료합니다.
+            if (parents_mask & ~path_mask).sum() == 0:
+                break
+            
+            # 새로 찾은 부모들을 경로 마스크에 추가합니다.
+            path_mask |= parents_mask
+            
+        return path_mask            
 
     def _reset(self, td: Optional[TensorDict] = None, **kwargs) -> TensorDict:
         if td is None:

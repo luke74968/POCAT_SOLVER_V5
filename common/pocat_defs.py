@@ -23,6 +23,9 @@ FEATURE_INDEX = {
 }
 FEATURE_DIM = 11
 
+PROMPT_FEATURE_DIM = 5 
+
+
 @dataclass
 class PocatConfig:
     """ config.json 파일의 내용을 담는 데이터 클래스 """

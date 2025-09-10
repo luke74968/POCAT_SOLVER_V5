@@ -1,5 +1,4 @@
-# trainer.py
-
+# transformer_solver/trainer.py
 import torch
 from tqdm import tqdm
 import os
@@ -9,11 +8,9 @@ from .model import PocatModel
 from .pocat_env import PocatEnv
 from common.pocat_visualizer import print_and_visualize_one_solution
 
-# 💡 수정된 import 구문
 from common.pocat_classes import Battery, LDO, BuckConverter, Load
-from common.pocat_defs import PocatConfig, NODE_TYPE_IC # <-- NODE_TYPE_IC를 여기서 가져옵니다.
+from common.pocat_defs import PocatConfig, NODE_TYPE_IC
 from common.config_loader import load_configuration_from_file
-
 
 
 
@@ -90,7 +87,7 @@ class PocatTrainer:
                 td = self.env.reset(
                     batch_size=args.batch_size
                 )
-                out = self.model(td, self.env)
+                out = self.model(td, self.env, decode_type='sampling')
                 
                 num_starts = self.env.generator.num_loads
                 # reward와 log_likelihood를 (탐색 횟수, 배치 크기) 형태로 변경합니다.
@@ -128,20 +125,26 @@ class PocatTrainer:
             
             # 💡 모델 저장 로직 (기존과 동일)
             if (epoch % args.trainer_params['model_save_interval'] == 0) or (epoch == args.trainer_params['epochs']):
-                args.log(f"Saving model at epoch {epoch}...")
-                # ... (저장 코드) ...
+                save_path = os.path.join(args.result_dir, f'epoch-{epoch}.pth')
+                args.log(f"Saving model at epoch {epoch} to {save_path}")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                }, save_path)
 
         args.log(" *** Training Done *** ")
 
     @torch.no_grad()
     def test(self):
-        """저장된 모델을 불러와 Power Tree를 생성하고 결과를 시각화합니다."""
         args = self.args
         args.log("==================== INFERENCE START ====================")
         self.model.eval()
 
-        td = self.env.reset(batch_size=64)
-        out = self.model(td, self.env)
+        td = self.env.reset(batch_size=1) # 테스트는 배치 1로 고정
+        
+        # --- 👇 [핵심] 테스트 시에는 'greedy' 방식으로 모델 호출 ---
+        out = self.model(td, self.env, decode_type='greedy')
 
         num_starts = self.env.generator.num_loads
         reward = unbatchify(out["reward"], num_starts)
@@ -153,8 +156,8 @@ class PocatTrainer:
 
         args.log(f"Generated Power Tree Cost: ${final_cost:.4f}")
         
-        # 💡 2. 시각화 함수 호출
         self.visualize_result(best_action_sequence, final_cost)
+
 
     def visualize_result(self, actions, cost):
         """모델이 생성한 action_sequence를 기반으로 결과를 시각화합니다."""

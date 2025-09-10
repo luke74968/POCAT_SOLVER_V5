@@ -265,40 +265,7 @@ def add_power_sequence_constraints(model, candidate_ics, loads, battery, constra
         for p_ic_name, j_edge_var in j_parents:
             for q_ic_name, k_edge_var in k_parents:
                 if p_ic_name == q_ic_name:
-                    model.AddBoolOr([j_edge_var.Not(), k_edge_var.Not()])
-    """전원 시퀀스(동일 부모 금지, 시간적 선후 관계) 제약 조건을 추가합니다
-    if 'power_sequences' not in constraints or not constraints['power_sequences']:
-        return
-        
-    is_ancestor = {
-        (p, c): model.NewBoolVar(f'anc_{p}_to_{c}')
-        for p in node_names for c in node_names if p != c
-    }
-    for p, c in edges:
-        model.AddImplication(edges[p, c], is_ancestor[p, c])
-    for a in node_names:
-        for b in ic_names:
-            for c in node_names:
-                if a == b or b == c or a == c: continue
-                model.AddBoolOr([is_ancestor[a, b].Not(), is_ancestor[b, c].Not(), is_ancestor[a, c]])
-    
-    parent_ic_vars = defaultdict(list)
-    for load in loads:
-        for p_ic in candidate_ics:
-            if (p_ic.name, load.name) in edges:
-                parent_ic_vars[load.name].append((p_ic.name, edges[p_ic.name, load.name]))
-
-    for seq in constraints['power_sequences']:
-        if seq.get('f') != 1: continue
-        j_name, k_name = seq['j'], seq['k']
-        for p in candidate_ics:
-            if (p.name, j_name) in edges and (p.name, k_name) in edges:
-                model.Add(edges[p.name, j_name] + edges[p.name, k_name] <= 1)
-        for p_j_name, j_edge in parent_ic_vars[j_name]:
-            for p_k_name, k_edge in parent_ic_vars[k_name]:
-                if p_j_name == p_k_name: continue
-                model.Add(is_ancestor[p_k_name, p_j_name] == 0).OnlyEnforceIf([j_edge, k_edge])
-    """            
+                    model.AddBoolOr([j_edge_var.Not(), k_edge_var.Not()])   
 
 # --- 💡 3. 재구성된 메인 모델 생성 함수 수정 ---
 def create_solver_model(candidate_ics, loads, battery, constraints, ic_groups):

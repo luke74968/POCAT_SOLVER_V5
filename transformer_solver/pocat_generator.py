@@ -156,19 +156,25 @@ class PocatGenerator:
         return features
 
     def __call__(self, batch_size: int, **kwargs) -> TensorDict:
-        # __call__ 메소드는 instance_repeats를 사용하지 않도록 수정
         node_features = self._create_feature_tensor()
         constraints = self.config.constraints
-        prompt_features = torch.tensor(
-            [
-                constraints.get("ambient_temperature", 25.0),
-                constraints.get("max_sleep_current", 0.0),
-            ]
-        )
+        
+        # --- 👇 [핵심] 프롬프트 피처 생성 로직 수정 ---
+        prompt_list = [
+            constraints.get("ambient_temperature", 25.0),
+            constraints.get("max_sleep_current", 0.0),
+            constraints.get("current_margin", 0.0),
+            constraints.get("thermal_margin_percent", 0.0),
+            len(constraints.get("power_sequences", [])) # 시퀀스 규칙의 개수를 피처로 사용
+        ]
+        
+        prompt_features = torch.tensor(prompt_list, dtype=torch.float32)
+        # --- 수정 완료 ---
+
         node_features = node_features.unsqueeze(0).expand(batch_size, -1, -1)
         prompt_features = prompt_features.unsqueeze(0).expand(batch_size, -1)
         
         return TensorDict(
-            { "nodes": node_features, "prompt_features": prompt_features, },
+            { "nodes": node_features, "prompt_features": prompt_features },
             batch_size=[batch_size],
         )
