@@ -6,7 +6,7 @@ from torch.distributions import Categorical # 💡 확률적 샘플링을 위해
 from typing import Tuple
 from tensordict import TensorDict
 
-from common.pocat_defs import FEATURE_DIM
+from common.pocat_defs import FEATURE_DIM, FEATURE_INDEX, NODE_TYPE_BATTERY, NODE_TYPE_IC, NODE_TYPE_LOAD
 from common.utils.common import batchify
 from .pocat_env import PocatEnv
 
@@ -60,19 +60,42 @@ def reshape_by_heads(qkv: torch.Tensor, head_num: int) -> torch.Tensor:
     q_reshaped = qkv.reshape(batch_s, n, head_num, -1)
     return q_reshaped.transpose(1, 2)
 
-def multi_head_attention(q, k, v, ninf_mask=None):
+# 💡 수정: multi_head_attention이 sparse_type을 인자로 받도록 변경
+def multi_head_attention(q, k, v, attention_mask=None, sparse_type=None):
     batch_s, head_num, n, key_dim = q.shape
+    
     score = torch.matmul(q, k.transpose(2, 3))
     score_scaled = score / (key_dim ** 0.5)
-    if ninf_mask is not None:
-        score_scaled = score_scaled + ninf_mask[:, None, :, :].expand(batch_s, head_num, n, k.size(2))
-    weights = nn.Softmax(dim=3)(score_scaled)
+    
+    if attention_mask is not None:
+        score_scaled = score_scaled.masked_fill(attention_mask.unsqueeze(1).unsqueeze(2) == 0, -1e9)
+        
+    if sparse_type == 'topk':
+        # Top-K Sparse Attention
+        # 어텐션 스코어가 높은 K개만 선택하여 마스크 생성
+        # 💡 [핵심 변경] K 값을 시퀀스 길이의 절반으로 동적 계산
+        #    k_top_k 파라미터를 제거하고, score_scaled의 마지막 차원 크기를 사용합니다.
+        seq_len = score_scaled.size(-1)
+        k_for_topk = max(1, seq_len // 2) # 최소 1개를 보장하면서 절반을 선택
+
+        # 어텐션 스코어가 높은 K개만 선택하여 마스크 생성
+        top_k_values, top_k_indices = torch.topk(score_scaled, k=k_for_topk, dim=-1)
+        
+        # 선택되지 않은 나머지 값들은 -inf로 마스킹
+        topk_mask = torch.zeros_like(score_scaled, dtype=torch.bool).scatter_(-1, top_k_indices, True)
+        attention_weights = score_scaled.masked_fill(~topk_mask, -1e9)
+        weights = nn.Softmax(dim=3)(attention_weights)
+    else:
+        # Standard (Dense) Attention
+        weights = nn.Softmax(dim=3)(score_scaled)
+        
     out = torch.matmul(weights, v)
     out_transposed = out.transpose(1, 2)
     return out_transposed.contiguous().view(batch_s, n, head_num * key_dim)
 
+# 💡 수정: EncoderLayer가 sparse_type을 인자로 받도록 변경
 class EncoderLayer(nn.Module):
-    def __init__(self, embedding_dim, head_num, qkv_dim, ffd='siglu', **model_params):
+    def __init__(self, embedding_dim, head_num, qkv_dim, ffd='siglu', use_sparse=False, **model_params):
         super().__init__()
         self.embedding_dim, self.head_num, self.qkv_dim = embedding_dim, head_num, qkv_dim
         self.Wq, self.Wk, self.Wv = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False), nn.Linear(embedding_dim, head_num * qkv_dim, bias=False), nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
@@ -81,15 +104,17 @@ class EncoderLayer(nn.Module):
         if ffd == 'siglu': self.feed_forward = ParallelGatedMLP(hidden_size=embedding_dim, **model_params)
         else: self.feed_forward = FeedForward(embedding_dim=embedding_dim, **model_params)
         self.normalization2 = Normalization(embedding_dim, **model_params)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.use_sparse = use_sparse
+
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
         q, k, v = reshape_by_heads(self.Wq(x), self.head_num), reshape_by_heads(self.Wk(x), self.head_num), reshape_by_heads(self.Wv(x), self.head_num)
-        mha_out = self.multi_head_combine(multi_head_attention(q, k, v))
+        
+        sparse_type = 'topk' if self.use_sparse else None
+        mha_out = self.multi_head_combine(multi_head_attention(q, k, v, attention_mask=attention_mask, sparse_type=sparse_type))
+        
         h = self.normalization1(x + mha_out)
         return self.normalization2(h + self.feed_forward(h))
 
-
-# 💡 수정: PocatPromptNet 클래스를 새 구조로 변경
-# 💡 수정: PocatPromptNet 클래스를 새 구조로 변경
 class PocatPromptNet(nn.Module):
     def __init__(self, embedding_dim: int, num_nodes: int, **kwargs):
         super().__init__()
@@ -133,28 +158,81 @@ class PocatPromptNet(nn.Module):
         return final_prompt_embedding.unsqueeze(1)
 
 
-# 💡 수정: PocatEncoder 클래스의 forward 함수 수정
+# 💡 수정: PocatEncoder를 CaDA와 같은 듀얼 어텐션 구조로 변경
 class PocatEncoder(nn.Module):
-    def __init__(self, embedding_dim: int, encoder_layer_num: int = 6, **kwargs):
+    def __init__(self, embedding_dim: int, encoder_layer_num: int = 6, **model_params):
         super().__init__()
         self.embedding_layer = nn.Linear(FEATURE_DIM, embedding_dim)
-        self.layers = nn.ModuleList([EncoderLayer(embedding_dim=embedding_dim, **kwargs) for _ in range(encoder_layer_num)])
+        
+        # Sparse 파라미터를 복사하여 수정
+        sparse_params = model_params.copy()
+        sparse_params['use_sparse'] = True
+        
+        global_params = model_params.copy()
+        global_params['use_sparse'] = False
+        
+        self.sparse_layers = nn.ModuleList([EncoderLayer(embedding_dim=embedding_dim, **sparse_params) for _ in range(encoder_layer_num)])
+        self.global_layers = nn.ModuleList([EncoderLayer(embedding_dim=embedding_dim, **global_params) for _ in range(encoder_layer_num)])
+        
+        self.sparse_fusion = nn.ModuleList([nn.Linear(embedding_dim, embedding_dim) for _ in range(encoder_layer_num)])
+        self.global_fusion = nn.ModuleList([nn.Linear(embedding_dim, embedding_dim) for _ in range(encoder_layer_num - 1)])
 
-    def forward(self, node_features: torch.Tensor, prompt_embedding: torch.Tensor) -> torch.Tensor:
-        # 1. 노드 피처를 초기 임베딩으로 변환
+    def _create_connectivity_mask(self, td: TensorDict) -> torch.Tensor:
+        nodes = td['nodes']
+        batch_size, num_nodes, _ = nodes.shape
+        
+        node_types_tensor = torch.tensor([self.get_node_type(i, td) for i in range(num_nodes)], device=nodes.device)
+        is_parent = (node_types_tensor == NODE_TYPE_IC) | (node_types_tensor == NODE_TYPE_BATTERY)
+        is_child = (node_types_tensor == NODE_TYPE_IC) | (node_types_tensor == NODE_TYPE_LOAD)
+        
+        parent_mask = is_parent.unsqueeze(0).unsqueeze(2).expand(batch_size, num_nodes, num_nodes)
+        child_mask = is_child.unsqueeze(0).unsqueeze(1).expand(batch_size, num_nodes, num_nodes)
+
+        parent_vout_min = nodes[:, :, FEATURE_INDEX["vout_min"]].unsqueeze(2)
+        parent_vout_max = nodes[:, :, FEATURE_INDEX["vout_max"]].unsqueeze(2)
+        child_vin_min = nodes[:, :, FEATURE_INDEX["vin_min"]].unsqueeze(1)
+        child_vin_max = nodes[:, :, FEATURE_INDEX["vin_max"]].unsqueeze(1)
+        
+        voltage_compatible = (parent_vout_min <= child_vin_max) & (parent_vout_max >= child_vin_min)
+        
+        mask = parent_mask & child_mask & voltage_compatible
+        mask.diagonal(dim1=-2, dim2=-1).fill_(False)
+        return mask
+
+    def get_node_type(self, node_idx, td):
+        # td['nodes'] 텐서에서 직접 node_type 정보를 가져옵니다.
+        # 이 예시에서는 one-hot 인코딩된 피처에서 argmax를 사용한다고 가정합니다.
+        return td['nodes'][0, node_idx, :FEATURE_INDEX["node_type"][1]].argmax(-1).item()
+
+    def forward(self, td: TensorDict, prompt_embedding: torch.Tensor) -> torch.Tensor:
+        node_features = td['nodes']
+        batch_size, num_nodes, _ = node_features.shape
         node_embeddings = self.embedding_layer(node_features)
         
-        # 2. 노드 임베딩과 프롬프트 임베딩을 연결(concatenate)
-        concatenated_embeddings = torch.cat((node_embeddings, prompt_embedding), dim=1)
+        connectivity_mask = self._create_connectivity_mask(td)
         
-        # 3. 인코더 레이어 통과
-        x = concatenated_embeddings
-        for layer in self.layers:
-            x = layer(x)
+        global_input = torch.cat((node_embeddings, prompt_embedding), dim=1)
+        global_attention_mask = torch.ones(batch_size, num_nodes + 1, num_nodes + 1, dtype=torch.bool, device=node_embeddings.device)
+        global_attention_mask[:, :num_nodes, :num_nodes] = connectivity_mask
+        
+        sparse_out = node_embeddings
+        global_out = global_input
+        
+        for i in range(len(self.sparse_layers)):
+            # Sparse Stream: Top-K 어텐션 (마스크 불필요)
+            sparse_out = self.sparse_layers[i](sparse_out, attention_mask=None)
             
-        # 4. 프롬프트 부분을 제외한 노드 임베딩만 반환
-        num_nodes = node_features.shape[1]
-        return x[:, :num_nodes, :]
+            # Global Stream: 연결성 마스크 기반 어텐션
+            global_out = self.global_layers[i](global_out, attention_mask=global_attention_mask)
+            
+            # Fusion
+            sparse_out = sparse_out + self.sparse_fusion[i](global_out[:, :num_nodes])
+            if i < len(self.global_layers) - 1:
+                global_nodes = global_out[:, :num_nodes] + self.global_fusion[i](sparse_out)
+                global_out = torch.cat((global_nodes, global_out[:, num_nodes:]), dim=1)
+                
+        return sparse_out
+
 
 class PocatDecoder(nn.Module):
     def __init__(self, embedding_dim: int, head_num: int = 8, **kwargs):
@@ -166,18 +244,13 @@ class PocatDecoder(nn.Module):
 class PocatModel(nn.Module):
     def __init__(self, **model_params):
         super().__init__()
-        embedding_dim = model_params['embedding_dim']
-        # 💡 수정: PocatPromptNet 초기화 시 num_nodes 정보 전달
-        #    (run.py에서 env.generator.num_nodes를 통해 전달해야 함)
-        self.prompt_net = PocatPromptNet(embedding_dim=embedding_dim, num_nodes=model_params['num_nodes'])
+        self.prompt_net = PocatPromptNet(embedding_dim=model_params['embedding_dim'], num_nodes=model_params['num_nodes'])
         self.encoder = PocatEncoder(**model_params)
         self.decoder = PocatDecoder(**model_params)
-        self.context_gru = nn.GRUCell(embedding_dim * 2, embedding_dim)
+        self.context_gru = nn.GRUCell(model_params['embedding_dim'] * 2, model_params['embedding_dim'])
+        self.load_select_wq = nn.Linear(model_params['embedding_dim'], model_params['embedding_dim'], bias=False)
+        self.load_select_wk = nn.Linear(model_params['embedding_dim'], model_params['embedding_dim'], bias=False)
 
-        self.load_select_wq = nn.Linear(embedding_dim, embedding_dim, bias=False)
-        self.load_select_wk = nn.Linear(embedding_dim, embedding_dim, bias=False)
-        
-    # --- 👇 [핵심] log_fn 인자 추가 ---
     def forward(self, td: TensorDict, env: PocatEnv, decode_type: str = 'greedy', pbar: object = None, status_msg: str = "", log_fn=None):
         base_desc = pbar.desc.split(' | ')[0] if pbar else ""
         
@@ -189,7 +262,7 @@ class PocatModel(nn.Module):
         # 💡 수정: 새로운 프롬프트 넷에 스칼라와 행렬 피처를 전달
 
         prompt_embedding = self.prompt_net(td["scalar_prompt_features"], td["matrix_prompt_features"])
-        encoded_nodes = self.encoder(td["nodes"], prompt_embedding)
+        encoded_nodes = self.encoder(td, prompt_embedding)        
         num_starts, start_nodes_idx = env.select_start_nodes(td)
         
         node_names = env.generator.config.node_names
