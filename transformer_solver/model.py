@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical # 💡 확률적 샘플링을 위해 추가
+from torch.distributions import Categorical
 from typing import Tuple
 from tensordict import TensorDict
 
@@ -63,7 +63,6 @@ def reshape_by_heads(qkv: torch.Tensor, head_num: int) -> torch.Tensor:
 # 💡 수정: multi_head_attention이 sparse_type을 인자로 받도록 변경
 def multi_head_attention(q, k, v, attention_mask=None, sparse_type=None):
     batch_s, head_num, n, key_dim = q.shape
-    
     score = torch.matmul(q, k.transpose(2, 3))
     score_scaled = score / (key_dim ** 0.5)
     
@@ -108,10 +107,8 @@ class EncoderLayer(nn.Module):
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
         q, k, v = reshape_by_heads(self.Wq(x), self.head_num), reshape_by_heads(self.Wk(x), self.head_num), reshape_by_heads(self.Wv(x), self.head_num)
-        
         sparse_type = 'topk' if self.use_sparse else None
         mha_out = self.multi_head_combine(multi_head_attention(q, k, v, attention_mask=attention_mask, sparse_type=sparse_type))
-        
         h = self.normalization1(x + mha_out)
         return self.normalization2(h + self.feed_forward(h))
 
@@ -180,41 +177,26 @@ class PocatEncoder(nn.Module):
     def _create_connectivity_mask(self, td: TensorDict) -> torch.Tensor:
         nodes = td['nodes']
         batch_size, num_nodes, _ = nodes.shape
-        
-        node_types_tensor = torch.tensor([self.get_node_type(i, td) for i in range(num_nodes)], device=nodes.device)
-        is_parent = (node_types_tensor == NODE_TYPE_IC) | (node_types_tensor == NODE_TYPE_BATTERY)
-        is_child = (node_types_tensor == NODE_TYPE_IC) | (node_types_tensor == NODE_TYPE_LOAD)
-        
+        node_types = nodes[0, :, :FEATURE_INDEX["node_type"][1]].argmax(-1)
+        is_parent = (node_types == NODE_TYPE_IC) | (node_types == NODE_TYPE_BATTERY)
+        is_child = (node_types == NODE_TYPE_IC) | (node_types == NODE_TYPE_LOAD)
         parent_mask = is_parent.unsqueeze(0).unsqueeze(2).expand(batch_size, num_nodes, num_nodes)
         child_mask = is_child.unsqueeze(0).unsqueeze(1).expand(batch_size, num_nodes, num_nodes)
-
-        parent_vout_min = nodes[:, :, FEATURE_INDEX["vout_min"]].unsqueeze(2)
-        parent_vout_max = nodes[:, :, FEATURE_INDEX["vout_max"]].unsqueeze(2)
-        child_vin_min = nodes[:, :, FEATURE_INDEX["vin_min"]].unsqueeze(1)
-        child_vin_max = nodes[:, :, FEATURE_INDEX["vin_max"]].unsqueeze(1)
-        
+        parent_vout_min, parent_vout_max = nodes[:, :, FEATURE_INDEX["vout_min"]].unsqueeze(2), nodes[:, :, FEATURE_INDEX["vout_max"]].unsqueeze(2)
+        child_vin_min, child_vin_max = nodes[:, :, FEATURE_INDEX["vin_min"]].unsqueeze(1), nodes[:, :, FEATURE_INDEX["vin_max"]].unsqueeze(1)
         voltage_compatible = (parent_vout_min <= child_vin_max) & (parent_vout_max >= child_vin_min)
-        
         mask = parent_mask & child_mask & voltage_compatible
         mask.diagonal(dim1=-2, dim2=-1).fill_(False)
         return mask
-
-    def get_node_type(self, node_idx, td):
-        # td['nodes'] 텐서에서 직접 node_type 정보를 가져옵니다.
-        # 이 예시에서는 one-hot 인코딩된 피처에서 argmax를 사용한다고 가정합니다.
-        return td['nodes'][0, node_idx, :FEATURE_INDEX["node_type"][1]].argmax(-1).item()
 
     def forward(self, td: TensorDict, prompt_embedding: torch.Tensor) -> torch.Tensor:
         node_features = td['nodes']
         batch_size, num_nodes, _ = node_features.shape
         node_embeddings = self.embedding_layer(node_features)
-        
         connectivity_mask = self._create_connectivity_mask(td)
-        
         global_input = torch.cat((node_embeddings, prompt_embedding), dim=1)
         global_attention_mask = torch.ones(batch_size, num_nodes + 1, num_nodes + 1, dtype=torch.bool, device=node_embeddings.device)
         global_attention_mask[:, :num_nodes, :num_nodes] = connectivity_mask
-        
         sparse_out = node_embeddings
         global_out = global_input
         
@@ -229,17 +211,49 @@ class PocatEncoder(nn.Module):
             sparse_out = sparse_out + self.sparse_fusion[i](global_out[:, :num_nodes])
             if i < len(self.global_layers) - 1:
                 global_nodes = global_out[:, :num_nodes] + self.global_fusion[i](sparse_out)
-                global_out = torch.cat((global_nodes, global_out[:, num_nodes:]), dim=1)
-                
+                global_out = torch.cat((global_nodes, global_out[:, num_nodes:]), dim=1)  
         return sparse_out
 
 
+# 💡 수정: CaDA 스타일의 어텐션 기반 디코더로 변경
 class PocatDecoder(nn.Module):
-    def __init__(self, embedding_dim: int, head_num: int = 8, **kwargs):
+    def __init__(self, embedding_dim, head_num, qkv_dim, **model_params):
         super().__init__()
         self.embedding_dim = embedding_dim
-        self.parent_wq, self.parent_wk = nn.Linear(embedding_dim * 2, embedding_dim, bias=False), nn.Linear(embedding_dim, embedding_dim, bias=False)
+        self.head_num = head_num
+        self.qkv_dim = qkv_dim
+        
+        # 각 Phase에 맞는 Query 생성용 Linear 레이어
+        self.Wq_load_select = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wq_parent_select = nn.Linear(embedding_dim * 2, head_num * qkv_dim, bias=False)
+        
+        # Key, Value, 최종 Logit Key 생성용 Linear 레이어
+        self.Wk = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wv = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wk_logit = nn.Linear(embedding_dim, embedding_dim, bias=False)
+        
+        self.multi_head_combine = nn.Linear(head_num * qkv_dim, embedding_dim)
 
+    def forward(self, context_embedding, encoded_nodes, mask, phase):
+        # 1. Key, Value 생성 (매번 계산)
+        k = reshape_by_heads(self.Wk(encoded_nodes), head_num=self.head_num)
+        v = reshape_by_heads(self.Wv(encoded_nodes), head_num=self.head_num)
+
+        # 2. Phase에 따라 Query 생성
+        if phase == 0:
+            q = reshape_by_heads(self.Wq_load_select(context_embedding), head_num=self.head_num)
+        elif phase == 1:
+            q = reshape_by_heads(self.Wq_parent_select(context_embedding), head_num=self.head_num)
+        
+        # 3. Multi-Head Attention 수행
+        mha_out = multi_head_attention(q, k, v, attention_mask=mask)
+        mh_atten_out = self.multi_head_combine(mha_out)
+        
+        # 4. 최종 Logits 계산 (Single-Head Attention)
+        logit_k = self.Wk_logit(encoded_nodes).transpose(1, 2) # (B, embedding_dim, N)
+        scores = torch.matmul(mh_atten_out, logit_k).squeeze(1) / (self.embedding_dim ** 0.5)
+        
+        return scores
 
 class PocatModel(nn.Module):
     def __init__(self, **model_params):
@@ -248,8 +262,6 @@ class PocatModel(nn.Module):
         self.encoder = PocatEncoder(**model_params)
         self.decoder = PocatDecoder(**model_params)
         self.context_gru = nn.GRUCell(model_params['embedding_dim'] * 2, model_params['embedding_dim'])
-        self.load_select_wq = nn.Linear(model_params['embedding_dim'], model_params['embedding_dim'], bias=False)
-        self.load_select_wk = nn.Linear(model_params['embedding_dim'], model_params['embedding_dim'], bias=False)
 
     def forward(self, td: TensorDict, env: PocatEnv, decode_type: str = 'greedy', pbar: object = None, status_msg: str = "", log_fn=None):
         base_desc = pbar.desc.split(' | ')[0] if pbar else ""
@@ -260,11 +272,14 @@ class PocatModel(nn.Module):
             if log_fn: log_fn(desc)
         
         # 💡 수정: 새로운 프롬프트 넷에 스칼라와 행렬 피처를 전달
-
+        # --- 1. 인코딩 ---
         prompt_embedding = self.prompt_net(td["scalar_prompt_features"], td["matrix_prompt_features"])
         encoded_nodes = self.encoder(td, prompt_embedding)        
+
+        # --- 2. 디코딩 준비 (POMO) ---
         num_starts, start_nodes_idx = env.select_start_nodes(td)
-        
+
+        # 로깅을 위한 변수
         node_names = env.generator.config.node_names
         num_total_loads = env.generator.num_loads
         
@@ -276,6 +291,7 @@ class PocatModel(nn.Module):
         context_embedding = encoded_nodes.mean(dim=1)
         log_probs, actions = [], []
         
+        # --- 3. 첫 번째 액션(Load 선택) 및 환경 초기화 ---
         action_part1 = start_nodes_idx.repeat(batch_size)
         action_part2 = torch.zeros_like(action_part1)
         action = torch.stack([action_part1, action_part2], dim=1)
@@ -286,6 +302,8 @@ class PocatModel(nn.Module):
         actions.append(action)
         log_probs.append(torch.zeros(expanded_batch_size, device=td.device))
         
+
+        # --- 4. 디코딩 루프 시작 ---
         decoding_step = 0
         while not td["done"].all():
             decoding_step += 1
@@ -295,7 +313,7 @@ class PocatModel(nn.Module):
                 current_node_name = node_names[current_node_idx] if current_node_idx != -1 else "N/A"
 
                 detail_msg = f"◀ Decoding ({num_connected_loads}/{num_total_loads} Loads, Step {decoding_step}: Conn. '{current_node_name}')"
-                desc = f"{base_desc} | {status_msg} | ▶ Encoding (done) | {detail_msg}"
+                desc = f"{pbar.desc.split(' | ')[0]} | {status_msg} | ▶ Encoding (done) | {detail_msg}"
                 pbar.set_description(desc)
                 if log_fn: log_fn(desc)
 
@@ -303,47 +321,35 @@ class PocatModel(nn.Module):
             phase = td["decoding_phase"][0, 0].item()
 
             if phase == 0:
+                # --- Phase 0: 다음으로 연결할 Load 선택 ---
                 main_tree_nodes = encoded_nodes * td["main_tree_mask"].unsqueeze(-1)
-                context_for_load_select = main_tree_nodes.sum(1) / (td["main_tree_mask"].sum(1, keepdim=True) + 1e-9)
-                
-                q = self.load_select_wq(context_for_load_select).unsqueeze(1)
-                k = self.load_select_wk(encoded_nodes)
-                scores = torch.matmul(q, k.transpose(1, 2)).squeeze(1) / (self.decoder.embedding_dim ** 0.5)
+                context = main_tree_nodes.sum(1) / (td["main_tree_mask"].sum(1, keepdim=True) + 1e-9)
+
                 mask_for_load_select = mask[:, :, 0]
-                scores = scores.masked_fill(~mask_for_load_select, -1e9)
+                scores = self.decoder(context.unsqueeze(1), encoded_nodes, mask_for_load_select.unsqueeze(1), phase)
+                scores.masked_fill_(~mask_for_load_select, -1e9)
                 
                 log_prob = F.log_softmax(scores, dim=-1)
-                
-                if decode_type == 'sampling':
-                    selected_load = Categorical(probs=log_prob.exp()).sample()
-                else:
-                    selected_load = log_prob.argmax(dim=-1)
-                
+                selected_load = Categorical(probs=log_prob.exp()).sample() if decode_type == 'sampling' else log_prob.argmax(dim=-1)
                 action = torch.stack([selected_load, torch.zeros_like(selected_load)], dim=1)
                 log_prob_val = log_prob.gather(1, selected_load.unsqueeze(-1)).squeeze(-1)
 
             elif phase == 1:
+                # --- Phase 1: 현재 경로를 이을 부모 노드 선택 ---
                 trajectory_head_idx = td["trajectory_head"].squeeze(-1)
                 head_emb = encoded_nodes[torch.arange(expanded_batch_size), trajectory_head_idx]
-                
-                parent_q_in = torch.cat([context_embedding, head_emb], dim=1)
-                parent_q = self.decoder.parent_wq(parent_q_in).unsqueeze(1)
-                parent_k = self.decoder.parent_wk(encoded_nodes)
-                parent_scores = torch.matmul(parent_q, parent_k.transpose(1, 2)).squeeze(1) / (self.decoder.embedding_dim ** 0.5)
+                context = torch.cat([context_embedding, head_emb], dim=1)
                 
                 mask_for_parent_select = mask[torch.arange(expanded_batch_size), :, trajectory_head_idx]
-                parent_scores.masked_fill_(~mask_for_parent_select, -1e9)
+                scores = self.decoder(context.unsqueeze(1), encoded_nodes, mask_for_parent_select.unsqueeze(1), phase)
+                scores.masked_fill_(~mask_for_parent_select, -1e9)
                 
-                parent_log_probs = F.log_softmax(parent_scores, dim=-1)
-
-                if decode_type == 'sampling':
-                    selected_parent_idx = Categorical(probs=parent_log_probs.exp()).sample()
-                else:
-                    selected_parent_idx = parent_log_probs.argmax(dim=-1)
-                
+                log_prob = F.log_softmax(scores, dim=-1)
+                selected_parent_idx = Categorical(probs=log_prob.exp()).sample() if decode_type == 'sampling' else log_prob.argmax(dim=-1)
                 action = torch.stack([trajectory_head_idx, selected_parent_idx], dim=1)
-                log_prob_val = parent_log_probs.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
+                log_prob_val = log_prob.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
 
+            # --- 5. 환경 업데이트 및 다음 스텝 준비 ---
             td.set("action", action)
             output_td = env.step(td)
             td = output_td["next"]
@@ -351,6 +357,7 @@ class PocatModel(nn.Module):
             actions.append(action)
             log_probs.append(log_prob_val)
             
+            # 다음 스텝의 컨텍스트를 업데이트하기 위해 GRU 사용
             child_emb = encoded_nodes[torch.arange(expanded_batch_size), action[:, 0]]
             parent_emb = encoded_nodes[torch.arange(expanded_batch_size), action[:, 1]]
             context_embedding = self.context_gru(torch.cat([child_emb, parent_emb], dim=1), context_embedding)
