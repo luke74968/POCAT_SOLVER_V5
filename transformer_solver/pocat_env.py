@@ -268,12 +268,15 @@ class PocatEnv(EnvBase):
 
             can_be_parent = torch.ones(len(b_idx), num_nodes, dtype=torch.bool, device=self.device)
             node_types = td["nodes"][0, :, :FEATURE_INDEX["node_type"][1]].argmax(-1)
-            is_ic = (node_types == NODE_TYPE_IC)
+            
+                # 💡 [핵심 수정] 명확한 단계적 필터링으로 로직 변경
+            # 1. 부하는 부모가 될 수 없음
+            is_load = (node_types == NODE_TYPE_LOAD)
+            can_be_parent &= ~is_load.unsqueeze(0)
 
-            # 1. 토폴로지 제약: 현재 경로상에 있거나, 이미 메인 트리에 있는데 IC가 아니면 부모가 될 수 없음
+            # 2. 현재 만들고 있는 경로에 포함된 노드는 부모가 될 수 없음 (사이클 방지)
             current_path_mask = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"])
-            can_be_parent &= (is_ic.unsqueeze(0) & ~current_path_mask & ~td["main_tree_mask"][b_idx]) | td["main_tree_mask"][b_idx]
-            can_be_parent[torch.arange(len(b_idx), device=self.device), child_indices] = False # 자기 자신에게 연결 방지
+            can_be_parent &= ~current_path_mask
 
 
             # 💡 [핵심 수정] 전압 호환성 검사 로직을 '범위' 기반으로 올바르게 수정

@@ -2,12 +2,6 @@
   "battery": { "name": "Li-Ion_4S", "voltage_min": 12.0, "voltage_max": 16.8, "capacity_mah": 5000 },
   "available_ics": [
     { "type": "Buck", "name": "DCDC_A_HighV", "vin_min": 6.0, "vin_max": 18.0, "vout_min": 1.0, "vout_max": 5.5, "i_limit": 2.0, "operating_current": 0.0025, "quiescent_current": 0.0015, "cost": 0.60, "theta_ja": 40.0, "t_junction_max": 150 },
-    { "type": "Buck", "name": "DCDC_A_HighV_dummy", "vin_min": 6.0, "vin_max": 18.0, "vout_min": 1.0, "vout_max": 5.5, "i_limit": 2.0, "operating_current": 0.0025, "quiescent_current": 0.0015, "cost": 0.80, "theta_ja": 40.0, "t_junction_max": 150 },
-    { "type": "Buck", "name": "DCDC_B_LowV", "vin_min": 2.5, "vin_max": 6.0, "vout_min": 1.0, "vout_max": 3.3, "i_limit": 1.5, "operating_current": 0.0020, "quiescent_current": 0.001, "cost": 0.55, "theta_ja": 45.0, "t_junction_max": 150 },
-    { "type": "Buck", "name": "DCDC_C_HighI", "vin_min": 8.0, "vin_max": 18.0, "vout_min": 1.0, "vout_max": 5.0, "i_limit": 4.0, "operating_current": 0.0030, "quiescent_current": 0.002, "cost": 1.1, "theta_ja": 35.0, "t_junction_max": 150 },
-    { "type": "LDO", "name": "LDO_X_Gen", "vin_min": 2.0, "vin_max": 6.0, "vout_min": 1.2, "vout_max": 3.3, "i_limit": 0.3, "v_dropout": 0.25, "operating_current": 0.0008, "quiescent_current": 0.00009, "cost": 0.3, "theta_ja": 60.0, "t_junction_max": 125 },
-    { "type": "LDO", "name": "LDO_Y_LowNoise", "vin_min": 2.7, "vin_max": 5.5, "vout_min": 2.5, "vout_max": 3.3, "i_limit": 0.5, "v_dropout": 0.2, "operating_current": 0.001, "quiescent_current": 0.0001, "cost": 0.45, "theta_ja": 55.0, "t_junction_max": 125 },
-    { "type": "Buck", "name": "DCDC_D_Tiny", "vin_min": 2.5, "vin_max": 5.5, "vout_min": 0.8, "vout_max": 1.8, "i_limit": 0.8, "operating_current": 0.0015, "quiescent_current": 0.0005, "cost": 0.7, "theta_ja": 65.0, "t_junction_max": 125 },
     { "type": "LDO", "name": "LDO_Z_HighVin", "vin_min": 5.5, "vin_max": 30.0, "vout_min": 1.2, "vout_max": 12.0, "i_limit": 0.5, "v_dropout": 0.6, "operating_current": 0.0015, "quiescent_current": 0.0001, "cost": 0.50, "theta_ja": 29.7, "t_junction_max": 125 }
 
   ],
