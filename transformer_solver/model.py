@@ -63,11 +63,15 @@ def reshape_by_heads(qkv: torch.Tensor, head_num: int) -> torch.Tensor:
 # 💡 수정: multi_head_attention이 sparse_type을 인자로 받도록 변경
 def multi_head_attention(q, k, v, attention_mask=None, sparse_type=None):
     batch_s, head_num, n, key_dim = q.shape
+
     score = torch.matmul(q, k.transpose(2, 3))
     score_scaled = score / (key_dim ** 0.5)
     
     if attention_mask is not None:
-        score_scaled = score_scaled.masked_fill(attention_mask.unsqueeze(1).unsqueeze(2) == 0, -1e9)
+        # 💡 [핵심 수정] .unsqueeze(2)를 제거하여 마스크의 차원을 (B, 1, n, N)으로 올바르게 맞춥니다.
+        # 이렇게 하면 (B, H, n, N) 크기의 score_scaled 텐서와 정상적으로 브로드캐스팅됩니다.
+        score_scaled = score_scaled.masked_fill(attention_mask.unsqueeze(1) == 0, -1e9)
+
         
     if sparse_type == 'topk':
         # Top-K Sparse Attention

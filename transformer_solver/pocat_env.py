@@ -250,61 +250,52 @@ class PocatEnv(EnvBase):
     
     def get_action_mask(self, td: TensorDict) -> torch.Tensor:
         batch_size, num_nodes, _ = td["nodes"].shape
-        phase = td["decoding_phase"].squeeze(-1)
         mask = torch.zeros(batch_size, num_nodes, num_nodes, dtype=torch.bool, device=self.device)
-        phase0_idx, phase1_idx = torch.where(phase == 0)[0], torch.where(phase == 1)[0]
 
-        if phase0_idx.numel() > 0:
-            mask[phase0_idx, :, 0] = td["unconnected_loads_mask"][phase0_idx]
+        # Phase 0: 아직 연결되지 않은 Load만 선택 가능
+        phase0_mask = (td["decoding_phase"].squeeze(-1) == 0)
+        if phase0_mask.any():
+            mask[phase0_mask, :, 0] = td["unconnected_loads_mask"][phase0_mask]
 
-        if phase1_idx.numel() > 0:
-            b_idx = phase1_idx
+#        if phase1_idx.numel() > 0:
+#            b_idx = phase1_idx
+
+        # Phase 1: 현재 경로를 이을 부모 노드 선택
+        phase1_mask = ~phase0_mask
+        if phase1_mask.any():
+            b_idx = torch.where(phase1_mask)[0]
             child_indices = td["trajectory_head"][b_idx].squeeze(-1)
+
             can_be_parent = torch.ones(len(b_idx), num_nodes, dtype=torch.bool, device=self.device)
-            node_types = torch.tensor(self.generator.config.node_types, device=self.device)
-            is_ic = node_types == NODE_TYPE_IC
+            node_types = td["nodes"][0, :, :FEATURE_INDEX["node_type"][1]].argmax(-1)
+            is_ic = (node_types == NODE_TYPE_IC)
+
+            # 1. 토폴로지 제약: 현재 경로상에 있거나, 이미 메인 트리에 있는데 IC가 아니면 부모가 될 수 없음
             current_path_mask = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"])
-            
             can_be_parent &= (is_ic.unsqueeze(0) & ~current_path_mask & ~td["main_tree_mask"][b_idx]) | td["main_tree_mask"][b_idx]
-            can_be_parent[torch.arange(len(b_idx), device=self.device), child_indices] = False
+            can_be_parent[torch.arange(len(b_idx), device=self.device), child_indices] = False # 자기 자신에게 연결 방지
 
-            # --- 1. 전압 호환성 (FIX: equality -> range) ---
-            eps = 1e-6  # 부동소수 안전 여유
 
+            # 💡 [핵심 수정] 전압 호환성 검사 로직을 '범위' 기반으로 올바르게 수정
             child_vin_min = td["nodes"][b_idx, child_indices, FEATURE_INDEX["vin_min"]]
             child_vin_max = td["nodes"][b_idx, child_indices, FEATURE_INDEX["vin_max"]]
+            
+            parent_vout_min = td["nodes"][b_idx, :, FEATURE_INDEX["vout_min"]]
+            parent_vout_max = td["nodes"][b_idx, :, FEATURE_INDEX["vout_max"]]
 
-            # 확장된 IC 인스턴스는 vout_min == vout_max == 고정 Vout
-            parent_vout_fixed = td["nodes"][b_idx, :, FEATURE_INDEX["vout_min"]]
-
-            # IC 부모 허용: parent_vout ∈ [child_vin_min, child_vin_max]
-            is_ic_compatible = (
-                (parent_vout_fixed + eps >= child_vin_min.unsqueeze(1)) &
-                (parent_vout_fixed - eps <= child_vin_max.unsqueeze(1))
-            )
-
-            # 배터리 부모 허용: 배터리 [vout_min, vout_max]가 자식의 입력 범위를 덮을 때
-            battery_vout_min = td["nodes"][b_idx, 0, FEATURE_INDEX["vout_min"]].unsqueeze(1)
-            battery_vout_max = td["nodes"][b_idx, 0, FEATURE_INDEX["vout_max"]].unsqueeze(1)
-            is_battery_compatible = (
-                (battery_vout_min <= child_vin_min.unsqueeze(1)) &
-                (battery_vout_max >= child_vin_max.unsqueeze(1))
-            )
-
-            # 노드 타입 필터(부모는 배터리 or IC)
-            node_types = torch.tensor(self.generator.config.node_types, device=self.device)
-            is_ic = node_types == NODE_TYPE_IC
-
-            final_voltage_mask = is_ic_compatible & is_ic.unsqueeze(0)     # IC 부모
-            final_voltage_mask[:, 0] = is_battery_compatible.squeeze(1)    # 배터리 부모
-            can_be_parent &= final_voltage_mask
+            # 조건: 부모의 출력 전압 범위와 자식의 입력 전압 범위가 겹쳐야 함
+            # (parent_min <= child_max) AND (parent_max >= child_min)
+            is_voltage_compatible = (parent_vout_min <= child_vin_max.unsqueeze(1)) & \
+                                    (parent_vout_max >= child_vin_min.unsqueeze(1))
+            can_be_parent &= is_voltage_compatible
 
             # 2. 전류 한계
             path_nodes_currents = (td["nodes"][b_idx, :, FEATURE_INDEX["current_active"]] * current_path_mask).sum(dim=1)
             prospective_draw = td["ic_current_draw"][b_idx] + path_nodes_currents.unsqueeze(1)
             parent_limits = td["nodes"][b_idx, :, FEATURE_INDEX["i_limit"]]
-            inf_limits = torch.where(parent_limits > 0, parent_limits, float("inf"))
-            can_be_parent &= prospective_draw <= inf_limits
+            # 배터리(i_limit=0)는 전류 한계가 없다고 가정
+            can_be_parent &= (prospective_draw <= parent_limits) | (parent_limits == 0) 
+
             
             # 3. 기타 제약조건
             # (이하 로직은 기존과 동일하게 유지)
@@ -360,3 +351,4 @@ class PocatEnv(EnvBase):
             max_sleep_current = self.generator.config.constraints.get("max_sleep_current", 0.0)
             if max_sleep_current > 0:
                 loads_info = self.generator.config.loads
+        return reward
