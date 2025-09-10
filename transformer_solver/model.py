@@ -219,8 +219,8 @@ class PocatEncoder(nn.Module):
         global_out = global_input
         
         for i in range(len(self.sparse_layers)):
-            # Sparse Stream: Top-K 어텐션 (마스크 불필요)
-            sparse_out = self.sparse_layers[i](sparse_out, attention_mask=None)
+            # 💡 [핵심 수정] Sparse Stream에 'connectivity_mask'를 전달합니다.
+            sparse_out = self.sparse_layers[i](sparse_out, attention_mask=connectivity_mask)
             
             # Global Stream: 연결성 마스크 기반 어텐션
             global_out = self.global_layers[i](global_out, attention_mask=global_attention_mask)

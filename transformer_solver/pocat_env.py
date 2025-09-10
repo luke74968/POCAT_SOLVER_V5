@@ -268,16 +268,35 @@ class PocatEnv(EnvBase):
             can_be_parent &= (is_ic.unsqueeze(0) & ~current_path_mask & ~td["main_tree_mask"][b_idx]) | td["main_tree_mask"][b_idx]
             can_be_parent[torch.arange(len(b_idx), device=self.device), child_indices] = False
 
-            # 1. 전압 호환성
-            child_vin = td["nodes"][b_idx, child_indices, FEATURE_INDEX["vin_min"]]
-            parent_vout = td["nodes"][b_idx, :, FEATURE_INDEX["vout_min"]]
-            is_ic_compatible = (parent_vout == child_vin.unsqueeze(1)) & is_ic.unsqueeze(0)
-            
-            battery_vout_min, battery_vout_max = td["nodes"][b_idx, 0, FEATURE_INDEX["vout_min"]], td["nodes"][b_idx, 0, FEATURE_INDEX["vout_max"]]
-            is_battery_compatible = (child_vin.unsqueeze(1) >= battery_vout_min.unsqueeze(1)) & (child_vin.unsqueeze(1) <= battery_vout_max.unsqueeze(1))
-            
-            final_voltage_mask = is_ic_compatible
-            final_voltage_mask[:, 0] = is_battery_compatible.squeeze(1)
+            # --- 1. 전압 호환성 (FIX: equality -> range) ---
+            eps = 1e-6  # 부동소수 안전 여유
+
+            child_vin_min = td["nodes"][b_idx, child_indices, FEATURE_INDEX["vin_min"]]
+            child_vin_max = td["nodes"][b_idx, child_indices, FEATURE_INDEX["vin_max"]]
+
+            # 확장된 IC 인스턴스는 vout_min == vout_max == 고정 Vout
+            parent_vout_fixed = td["nodes"][b_idx, :, FEATURE_INDEX["vout_min"]]
+
+            # IC 부모 허용: parent_vout ∈ [child_vin_min, child_vin_max]
+            is_ic_compatible = (
+                (parent_vout_fixed + eps >= child_vin_min.unsqueeze(1)) &
+                (parent_vout_fixed - eps <= child_vin_max.unsqueeze(1))
+            )
+
+            # 배터리 부모 허용: 배터리 [vout_min, vout_max]가 자식의 입력 범위를 덮을 때
+            battery_vout_min = td["nodes"][b_idx, 0, FEATURE_INDEX["vout_min"]].unsqueeze(1)
+            battery_vout_max = td["nodes"][b_idx, 0, FEATURE_INDEX["vout_max"]].unsqueeze(1)
+            is_battery_compatible = (
+                (battery_vout_min <= child_vin_min.unsqueeze(1)) &
+                (battery_vout_max >= child_vin_max.unsqueeze(1))
+            )
+
+            # 노드 타입 필터(부모는 배터리 or IC)
+            node_types = torch.tensor(self.generator.config.node_types, device=self.device)
+            is_ic = node_types == NODE_TYPE_IC
+
+            final_voltage_mask = is_ic_compatible & is_ic.unsqueeze(0)     # IC 부모
+            final_voltage_mask[:, 0] = is_battery_compatible.squeeze(1)    # 배터리 부모
             can_be_parent &= final_voltage_mask
 
             # 2. 전류 한계
