@@ -1,0 +1,33 @@
+{
+  "battery": { "name": "Li-Ion_4S", "voltage_min": 12.0, "voltage_max": 16.8, "capacity_mah": 5000 },
+  "available_ics": [
+    { "type": "Buck", "name": "DCDC_A_HighV", "vin_min": 6.0, "vin_max": 18.0, "vout_min": 1.0, "vout_max": 5.5, "i_limit": 2.0, "operating_current": 0.0025, "quiescent_current": 0.0015, "cost": 0.60, "theta_ja": 40.0, "t_junction_max": 150 },
+    { "type": "Buck", "name": "DCDC_A_HighV_dummy", "vin_min": 6.0, "vin_max": 18.0, "vout_min": 1.0, "vout_max": 5.5, "i_limit": 2.0, "operating_current": 0.0025, "quiescent_current": 0.0015, "cost": 0.80, "theta_ja": 40.0, "t_junction_max": 150 },
+    { "type": "Buck", "name": "DCDC_B_LowV", "vin_min": 2.5, "vin_max": 6.0, "vout_min": 1.0, "vout_max": 3.3, "i_limit": 1.5, "operating_current": 0.0020, "quiescent_current": 0.001, "cost": 0.55, "theta_ja": 45.0, "t_junction_max": 150 },
+    { "type": "Buck", "name": "DCDC_C_HighI", "vin_min": 8.0, "vin_max": 18.0, "vout_min": 1.0, "vout_max": 5.0, "i_limit": 4.0, "operating_current": 0.0030, "quiescent_current": 0.002, "cost": 1.1, "theta_ja": 35.0, "t_junction_max": 150 },
+    { "type": "LDO", "name": "LDO_X_Gen", "vin_min": 2.0, "vin_max": 6.0, "vout_min": 1.2, "vout_max": 3.3, "i_limit": 0.3, "v_dropout": 0.25, "operating_current": 0.0008, "quiescent_current": 0.00009, "cost": 0.3, "theta_ja": 60.0, "t_junction_max": 125 },
+    { "type": "LDO", "name": "LDO_Y_LowNoise", "vin_min": 2.7, "vin_max": 5.5, "vout_min": 2.5, "vout_max": 3.3, "i_limit": 0.5, "v_dropout": 0.2, "operating_current": 0.001, "quiescent_current": 0.0001, "cost": 0.45, "theta_ja": 55.0, "t_junction_max": 125 },
+    { "type": "Buck", "name": "DCDC_D_Tiny", "vin_min": 2.5, "vin_max": 5.5, "vout_min": 0.8, "vout_max": 1.8, "i_limit": 0.8, "operating_current": 0.0015, "quiescent_current": 0.0005, "cost": 0.7, "theta_ja": 65.0, "t_junction_max": 125 },
+    { "type": "LDO", "name": "LDO_Z_HighVin", "vin_min": 5.5, "vin_max": 30.0, "vout_min": 1.2, "vout_max": 12.0, "i_limit": 0.5, "v_dropout": 0.6, "operating_current": 0.0015, "quiescent_current": 0.0001, "cost": 0.50, "theta_ja": 29.7, "t_junction_max": 125 }
+
+  ],
+  "loads": [
+    { "name": "MCU_Main", "voltage_req_min": 3.135, "voltage_req_max": 3.465, "voltage_typical": 3.3, "current_active": 0.150, "current_sleep": 0.0001, "independent_rail_type": "exclusive_path" },
+    { "name": "CAN_Transceiver", "voltage_req_min": 4.75, "voltage_req_max": 5.25, "voltage_typical": 5.0, "current_active": 0.070, "current_sleep": 0.0001, "independent_rail_type": "exclusive_supplier" , "always_on_in_sleep": true }
+  ],
+  "constraints": {
+    "ambient_temperature": 75,
+    "current_margin": 0.10,
+    "power_sequences": [
+      { "j": "MCU_Main", "k": "DDR_Core", "f": 1 },
+      { "j": "DDR_Core", "k": "eMMC_Memory", "f": 1 }
+    ],
+    "thermal_margin_percent": 0.10,
+    "max_sleep_current": 0.0091,
+    
+    "parallel_search_settings": {
+      "enabled": true,
+      "max_solutions_to_generate": 100
+    }
+  }
+}

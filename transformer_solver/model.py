@@ -161,7 +161,7 @@ class PocatModel(nn.Module):
                 q = self.load_select_wq(context_for_load_select).unsqueeze(1)
                 k = self.load_select_wk(encoded_nodes)
                 scores = torch.matmul(q, k.transpose(1, 2)).squeeze(1) / (self.decoder.embedding_dim ** 0.5)
-                scores[~mask[:, :, 0].transpose(0, 1)] = -1e9 # 마스크 형태에 맞게 수정
+                scores = scores.masked_fill(~mask[:, :, 0], -1e9)
                 
                 log_prob = F.log_softmax(scores, dim=-1)
                 selected_load = log_prob.argmax(dim=-1)
