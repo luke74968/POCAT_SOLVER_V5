@@ -120,14 +120,24 @@ class PocatModel(nn.Module):
         self.decoder = PocatDecoder(**model_params)
         self.context_gru = nn.GRUCell(embedding_dim * 2, embedding_dim)
         
-        # 💡 새 Load 선택을 위한 별도의 디코더 Query-Key 정의
         self.load_select_wq = nn.Linear(embedding_dim, embedding_dim, bias=False)
         self.load_select_wk = nn.Linear(embedding_dim, embedding_dim, bias=False)
         
-    def forward(self, td: TensorDict, env: PocatEnv, decode_type: str = 'greedy'):
+    # --- 👇 [핵심] log_fn 인자 추가 ---
+    def forward(self, td: TensorDict, env: PocatEnv, decode_type: str = 'greedy', pbar: object = None, status_msg: str = "", log_fn=None):
+        base_desc = pbar.desc.split(' | ')[0] if pbar else ""
+        
+        if pbar:
+            desc = f"{base_desc} | {status_msg} | ▶ Encoding (ing..)"
+            pbar.set_description(desc)
+            if log_fn: log_fn(desc)
+        
         prompt_embedding = self.prompt_net(td["prompt_features"])
         encoded_nodes = self.encoder(td["nodes"], prompt_embedding)
         num_starts, start_nodes_idx = env.select_start_nodes(td)
+        
+        node_names = env.generator.config.node_names
+        num_total_loads = env.generator.num_loads
         
         batch_size = td.batch_size[0]
         td = batchify(td, num_starts)
@@ -146,8 +156,20 @@ class PocatModel(nn.Module):
         td = output_td["next"]
         actions.append(action)
         log_probs.append(torch.zeros(expanded_batch_size, device=td.device))
-
+        
+        decoding_step = 0
         while not td["done"].all():
+            decoding_step += 1
+            if pbar:
+                num_connected_loads = num_total_loads - td["unconnected_loads_mask"][0].sum().item()
+                current_node_idx = td["trajectory_head"][0].item()
+                current_node_name = node_names[current_node_idx] if current_node_idx != -1 else "N/A"
+
+                detail_msg = f"◀ Decoding ({num_connected_loads}/{num_total_loads} Loads, Step {decoding_step}: Conn. '{current_node_name}')"
+                desc = f"{base_desc} | {status_msg} | ▶ Encoding (done) | {detail_msg}"
+                pbar.set_description(desc)
+                if log_fn: log_fn(desc)
+
             mask = env.get_action_mask(td)
             phase = td["decoding_phase"][0, 0].item()
 
@@ -163,11 +185,9 @@ class PocatModel(nn.Module):
                 
                 log_prob = F.log_softmax(scores, dim=-1)
                 
-                # --- 👇 [핵심] decode_type에 따라 행동 선택 방식 변경 ---
                 if decode_type == 'sampling':
-                    # 확률 분포에서 샘플링
                     selected_load = Categorical(probs=log_prob.exp()).sample()
-                else: # 'greedy'
+                else:
                     selected_load = log_prob.argmax(dim=-1)
                 
                 action = torch.stack([selected_load, torch.zeros_like(selected_load)], dim=1)
@@ -187,10 +207,9 @@ class PocatModel(nn.Module):
                 
                 parent_log_probs = F.log_softmax(parent_scores, dim=-1)
 
-                # --- 👇 [핵심] decode_type에 따라 행동 선택 방식 변경 ---
                 if decode_type == 'sampling':
                     selected_parent_idx = Categorical(probs=parent_log_probs.exp()).sample()
-                else: # 'greedy'
+                else:
                     selected_parent_idx = parent_log_probs.argmax(dim=-1)
                 
                 action = torch.stack([trajectory_head_idx, selected_parent_idx], dim=1)

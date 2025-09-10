@@ -2,6 +2,7 @@
 import torch
 from tqdm import tqdm
 import os
+import time # 💡 시간 측정을 위해 time 모듈 추가
 
 from common.utils.common import TimeEstimator, clip_grad_norms, unbatchify
 from .model import PocatModel
@@ -74,42 +75,57 @@ class PocatTrainer:
             args.log('=================================================================')
             
             self.model.train()
-            # 💡 1. tqdm의 range를 1부터 시작하도록 변경하여 스텝 번호를 맞춥니다.
+            
             train_pbar = tqdm(range(1, args.trainer_params['train_step'] + 1), 
                               desc=f"Epoch {epoch}/{args.trainer_params['epochs']}", 
-                              ncols=100) # 진행률 표시줄의 너비를 고정
+                              ncols=140)
             
             total_loss = 0.0
             total_cost = 0.0
 
             for step in train_pbar:
+                step_start_time = time.time()
                 self.optimizer.zero_grad()
-                td = self.env.reset(
-                    batch_size=args.batch_size
-                )
-                out = self.model(td, self.env, decode_type='sampling')
                 
+                base_desc = f"Epoch {epoch} (Step {step})"
+                status_message = f"🔄 Env Reset (ing..)"
+                
+                # --- 👇 [핵심] tqdm 설명 설정과 동시에 로그 기록 ---
+                train_pbar.set_description(f"{base_desc} | {status_message}")
+                args.log(train_pbar.desc)
+
+                reset_start_time = time.time()
+                td = self.env.reset(batch_size=args.batch_size)
+                reset_time = time.time() - reset_start_time
+                
+                status_message = f"🔄 Env Reset (done)"
+                train_pbar.set_description(f"{base_desc} | {status_message}")
+                args.log(train_pbar.desc)
+
+                model_start_time = time.time()
+                # --- 👇 [핵심] log 함수를 모델에 전달 ---
+                out = self.model(td, self.env, decode_type='sampling', pbar=train_pbar, status_msg=status_message, log_fn=args.log)
+                model_time = time.time() - model_start_time
+
+                status_message += f" | ▶ Encoding (done) | ◀ Decoding (done)"
+                status_message += f" | 📉 Loss & Bwd (ing..)"
+                train_pbar.set_description(f"{base_desc} | {status_message}")
+                args.log(train_pbar.desc)
+                
+                bwd_start_time = time.time()
                 num_starts = self.env.generator.num_loads
-                # reward와 log_likelihood를 (탐색 횟수, 배치 크기) 형태로 변경합니다.
                 reward = out["reward"].view(num_starts, -1)
                 log_likelihood = out["log_likelihood"].view(num_starts, -1)
                 
-                # [핵심 수정] 
-                # 1. 평균 보상을 기준으로 advantage를 계산합니다.
-                #    이제 모든 탐색 결과가 자신의 보상과 전체 평균을 비교하게 됩니다.
                 advantage = reward - reward.mean(dim=0, keepdims=True)
-                
-                # 2. advantage와 모든 log_likelihood를 사용하여 손실을 계산합니다.
-                #    'best'가 아닌 모든 결과를 학습에 반영합니다.
                 loss = -(advantage * log_likelihood).mean()
-
                 loss.backward()
+                bwd_time = time.time() - bwd_start_time
 
-                
                 clip_grad_norms(self.optimizer.param_groups, 1.0)
                 self.optimizer.step()
                 
-                best_reward, _ = reward.max(dim=0) # dim=0으로 수정 (탐색 결과 중 최고)
+                best_reward, _ = reward.max(dim=0)
                 current_cost = -best_reward.mean().item()
 
                 total_loss += loss.item()
@@ -117,13 +133,19 @@ class PocatTrainer:
                 
                 train_pbar.set_postfix({
                     'Loss': f'{total_loss/step:.4f}',
-                    'Cost': f'${total_cost/step:.2f}'
+                    'Cost': f'${total_cost/step:.2f}',
+                    'T_Reset': f'{reset_time*1000:.0f}ms',
+                    'T_Model': f'{model_time:.2f}s',
+                    'T_Bwd': f'{bwd_time*1000:.0f}ms'
                 })
+            
+            final_desc = f"Epoch {epoch}/{args.trainer_params['epochs']} | Done"
+            train_pbar.set_description(final_desc)
+            args.log(final_desc) # 에폭 종료 메시지도 로그에 기록
 
             self.scheduler.step()
             self.time_estimator.print_est_time(epoch, args.trainer_params['epochs'])
             
-            # 💡 모델 저장 로직 (기존과 동일)
             if (epoch % args.trainer_params['model_save_interval'] == 0) or (epoch == args.trainer_params['epochs']):
                 save_path = os.path.join(args.result_dir, f'epoch-{epoch}.pth')
                 args.log(f"Saving model at epoch {epoch} to {save_path}")
@@ -135,6 +157,8 @@ class PocatTrainer:
 
         args.log(" *** Training Done *** ")
 
+
+    # ... (test, visualize_result 메소드는 기존과 동일) ...
     @torch.no_grad()
     def test(self):
         args = self.args

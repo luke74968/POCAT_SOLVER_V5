@@ -254,81 +254,74 @@ class PocatEnv(EnvBase):
         if phase1_idx.numel() > 0:
             b_idx = phase1_idx
             child_indices = td["trajectory_head"][b_idx].squeeze(-1)
-
-            # [수정] 'can_be_parent' 변수 초기화
             can_be_parent = torch.ones(len(b_idx), num_nodes, dtype=torch.bool, device=self.device)
-
             node_types = td["nodes"][0, :, :FEATURE_INDEX["node_type"][1]].argmax(-1)
             is_ic = node_types == NODE_TYPE_IC
-
             current_path_mask = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"])
-
-            # 기본 후보: (아직 사용되지 않은 IC) 또는 (이미 메인 트리에 속한 노드)
-            can_be_parent &= (
-                is_ic.unsqueeze(0) & ~current_path_mask & ~td["main_tree_mask"][b_idx]
-            ) | td["main_tree_mask"][b_idx]
-
-            # 자기 자신, 이미 경로에 포함된 노드는 부모가 될 수 없음
+            can_be_parent &= (is_ic.unsqueeze(0) & ~current_path_mask & ~td["main_tree_mask"][b_idx]) | td["main_tree_mask"][b_idx]
             can_be_parent[torch.arange(len(b_idx), device=self.device), child_indices] = False
 
-            # 1. 전압 호환성
-            head_node_vin_min = td["nodes"][b_idx, child_indices, FEATURE_INDEX["vin_min"]]
-            parent_vout_max = td["nodes"][b_idx, :, FEATURE_INDEX["vout_max"]]
-            can_be_parent &= parent_vout_max >= head_node_vin_min.unsqueeze(1)
+            # --- 👇 [핵심] 전압 호환성 검사 로직 수정 ---
+            # 자식 노드가 요구하는 입력 전압 범위
+            child_vin_req_min = td["nodes"][b_idx, child_indices, FEATURE_INDEX["vin_min"]]
+            child_vin_req_max = td["nodes"][b_idx, child_indices, FEATURE_INDEX["vin_max"]]
+            
+            # 부모 후보 노드의 출력 전압 (확장된 IC는 vout_min과 vout_max가 동일)
+            parent_vout = td["nodes"][b_idx, :, FEATURE_INDEX["vout_max"]]
+            
+            # 조건: 부모의 출력 전압이 자식의 요구 전압 범위 내에 있어야 함
+            is_voltage_compatible = (parent_vout >= child_vin_req_min.unsqueeze(1)) & \
+                                    (parent_vout <= child_vin_req_max.unsqueeze(1))
+            
+            # 배터리는 IC가 아니므로 별도 처리
+            # 배터리는 0번 노드, is_ic 마스크에서 False임
+            is_voltage_compatible[:, 0] = False 
+            
+            # 배터리(부모)와 자식 IC의 연결 조건
+            battery_vout_min = td["nodes"][b_idx, 0, FEATURE_INDEX["vout_min"]]
+            battery_vout_max = td["nodes"][b_idx, 0, FEATURE_INDEX["vout_max"]]
+            can_connect_to_battery = (child_vin_req_min <= battery_vout_min) & (child_vin_req_max >= battery_vout_max)
+            is_voltage_compatible[:, 0] = can_connect_to_battery
 
-            # 2. 전류 한계
-            path_nodes_currents = (
-                td["nodes"][b_idx, :, FEATURE_INDEX["current_active"]] * current_path_mask
-            ).sum(dim=1)
+            can_be_parent &= is_voltage_compatible
+            # --- 수정 완료 ---
+
+            path_nodes_currents = (td["nodes"][b_idx, :, FEATURE_INDEX["current_active"]] * current_path_mask).sum(dim=1)
             prospective_draw = td["ic_current_draw"][b_idx] + path_nodes_currents.unsqueeze(1)
             parent_limits = td["nodes"][b_idx, :, FEATURE_INDEX["i_limit"]]
             inf_limits = torch.where(parent_limits > 0, parent_limits, float("inf"))
             can_be_parent &= prospective_draw <= inf_limits
 
-            # 3. 전역 제약조건 (Independent Rail, Power Sequence)
-            constraints = self.generator.config.constraints
-            loads_info = self.generator.config.loads
-            node_names = self.generator.config.node_names
-
-            # 조상(ancestor) 행렬 계산: 현재 메인 트리에 대해서만 계산
+            # (이하 Independent Rail, Power Sequence 제약조건은 동일)
+            constraints, loads_info, node_names = self.generator.config.constraints, self.generator.config.loads, self.generator.config.node_names
             ancestors = td["adj_matrix"][b_idx].clone()
             for k in range(num_nodes):
                 for i in range(num_nodes):
                     for j in range(num_nodes):
                         ancestors[:, i, j] |= ancestors[:, i, k] & ancestors[:, k, j]
 
-            # 3a. Independent Rail
             head_load_idx = child_indices - (1 + len(self.generator.config.available_ics))
             for idx, b in enumerate(b_idx.tolist()):
                 if 0 <= head_load_idx[idx] < len(loads_info):
                     load = loads_info[head_load_idx[idx]]
                     rail_type = load.get("independent_rail_type")
                     if rail_type == "exclusive_supplier":
-                        num_children = td["adj_matrix"][b].sum(dim=1)
-                        can_be_parent[idx] &= num_children == 0
+                        can_be_parent[idx] &= td["adj_matrix"][b].sum(dim=1) == 0
                     elif rail_type == "exclusive_path":
-                        # 경로에 속할 모든 잠재적 부모들이 다른 자식을 가지면 안됨
-                        num_children = td["adj_matrix"][b].sum(dim=1)
-                        can_be_parent[idx] &= num_children <= 1
-
-            # 3b. Power Sequence
+                        can_be_parent[idx] &= td["adj_matrix"][b].sum(dim=1) <= 1
+            
             for seq in constraints.get("power_sequences", []):
-                if seq.get("f") != 1:
-                    continue
+                if seq.get("f") != 1: continue
                 j_name, k_name = seq["j"], seq["k"]
-                if j_name not in node_names or k_name not in node_names:
-                    continue
+                if j_name not in node_names or k_name not in node_names: continue
                 j_idx, k_idx = node_names.index(j_name), node_names.index(k_name)
-
-                # 현재 head가 k_idx인 경우, j의 조상이 될 수 있는 노드는 부모가 될 수 없음
-                is_head_k = child_indices == k_idx
-                if is_head_k.any():
-                    j_ancestors = ancestors[is_head_k, :, j_idx]
-                    can_be_parent[is_head_k] &= ~j_ancestors
-
+                is_head_k_mask = child_indices == k_idx
+                if is_head_k_mask.any():
+                    can_be_parent[is_head_k_mask] &= ~ancestors[is_head_k_mask, :, j_idx]
+            
             mask[b_idx, :, child_indices] = can_be_parent
-
         return mask
+
     
     def get_reward(self, td: TensorDict) -> torch.Tensor:
         """
