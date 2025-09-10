@@ -87,22 +87,74 @@ class EncoderLayer(nn.Module):
         h = self.normalization1(x + mha_out)
         return self.normalization2(h + self.feed_forward(h))
 
-class PocatPromptNet(nn.Module):
-    def __init__(self, embedding_dim: int, prompt_feature_dim: int = 5, **kwargs):
-        super().__init__()
-        self.model = nn.Sequential(nn.Linear(prompt_feature_dim, embedding_dim // 2), nn.ReLU(), nn.Linear(embedding_dim // 2, embedding_dim))
-    def forward(self, prompt_features: torch.Tensor) -> torch.Tensor:
-        return self.model(prompt_features).unsqueeze(1)
 
+# 💡 수정: PocatPromptNet 클래스를 새 구조로 변경
+# 💡 수정: PocatPromptNet 클래스를 새 구조로 변경
+class PocatPromptNet(nn.Module):
+    def __init__(self, embedding_dim: int, num_nodes: int, **kwargs):
+        super().__init__()
+        # 1. 스칼라 제약조건(4개)을 위한 네트워크
+        self.scalar_net = nn.Sequential(
+            nn.Linear(4, embedding_dim // 2),
+            nn.ReLU(),
+            nn.Linear(embedding_dim // 2, embedding_dim // 2)
+        )
+        
+        # 2. 시퀀스 제약 행렬(num_nodes * num_nodes)을 위한 네트워크
+        self.matrix_net = nn.Sequential(
+            nn.Linear(num_nodes * num_nodes, embedding_dim),
+            nn.ReLU(),
+            nn.Linear(embedding_dim, embedding_dim // 2)
+        )
+        
+        # 3. 결합된 임베딩을 최종 처리하는 네트워크
+        self.final_processor = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim), # (emb/2 + emb/2) -> emb
+            nn.LayerNorm(embedding_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, scalar_features: torch.Tensor, matrix_features: torch.Tensor) -> torch.Tensor:
+        # 각 네트워크를 통과시켜 임베딩 생성
+        scalar_embedding = self.scalar_net(scalar_features)
+        
+        # 행렬을 1차원으로 펼쳐서 입력
+        batch_size = matrix_features.shape[0]
+        matrix_flat = matrix_features.view(batch_size, -1)
+        matrix_embedding = self.matrix_net(matrix_flat)
+        
+        # 두 임베딩을 연결(concatenate)
+        combined_embedding = torch.cat([scalar_embedding, matrix_embedding], dim=-1)
+        
+        # 최종 프롬프트 임베딩 생성
+        final_prompt_embedding = self.final_processor(combined_embedding)
+        
+        # (batch, 1, embedding_dim) 형태로 리턴
+        return final_prompt_embedding.unsqueeze(1)
+
+
+# 💡 수정: PocatEncoder 클래스의 forward 함수 수정
 class PocatEncoder(nn.Module):
     def __init__(self, embedding_dim: int, encoder_layer_num: int = 6, **kwargs):
         super().__init__()
         self.embedding_layer = nn.Linear(FEATURE_DIM, embedding_dim)
         self.layers = nn.ModuleList([EncoderLayer(embedding_dim=embedding_dim, **kwargs) for _ in range(encoder_layer_num)])
+
     def forward(self, node_features: torch.Tensor, prompt_embedding: torch.Tensor) -> torch.Tensor:
-        x = self.embedding_layer(node_features) + prompt_embedding
-        for layer in self.layers: x = layer(x)
-        return x
+        # 1. 노드 피처를 초기 임베딩으로 변환
+        node_embeddings = self.embedding_layer(node_features)
+        
+        # 2. 노드 임베딩과 프롬프트 임베딩을 연결(concatenate)
+        concatenated_embeddings = torch.cat((node_embeddings, prompt_embedding), dim=1)
+        
+        # 3. 인코더 레이어 통과
+        x = concatenated_embeddings
+        for layer in self.layers:
+            x = layer(x)
+            
+        # 4. 프롬프트 부분을 제외한 노드 임베딩만 반환
+        num_nodes = node_features.shape[1]
+        return x[:, :num_nodes, :]
 
 class PocatDecoder(nn.Module):
     def __init__(self, embedding_dim: int, head_num: int = 8, **kwargs):
@@ -115,11 +167,13 @@ class PocatModel(nn.Module):
     def __init__(self, **model_params):
         super().__init__()
         embedding_dim = model_params['embedding_dim']
-        self.prompt_net = PocatPromptNet(embedding_dim=embedding_dim)
+        # 💡 수정: PocatPromptNet 초기화 시 num_nodes 정보 전달
+        #    (run.py에서 env.generator.num_nodes를 통해 전달해야 함)
+        self.prompt_net = PocatPromptNet(embedding_dim=embedding_dim, num_nodes=model_params['num_nodes'])
         self.encoder = PocatEncoder(**model_params)
         self.decoder = PocatDecoder(**model_params)
         self.context_gru = nn.GRUCell(embedding_dim * 2, embedding_dim)
-        
+
         self.load_select_wq = nn.Linear(embedding_dim, embedding_dim, bias=False)
         self.load_select_wk = nn.Linear(embedding_dim, embedding_dim, bias=False)
         
@@ -132,7 +186,9 @@ class PocatModel(nn.Module):
             pbar.set_description(desc)
             if log_fn: log_fn(desc)
         
-        prompt_embedding = self.prompt_net(td["prompt_features"])
+        # 💡 수정: 새로운 프롬프트 넷에 스칼라와 행렬 피처를 전달
+
+        prompt_embedding = self.prompt_net(td["scalar_prompt_features"], td["matrix_prompt_features"])
         encoded_nodes = self.encoder(td["nodes"], prompt_embedding)
         num_starts, start_nodes_idx = env.select_start_nodes(td)
         

@@ -8,6 +8,8 @@ from torchrl.data import UnboundedContinuousTensorSpec as Unbounded, \
     DiscreteTensorSpec as Categorical, \
     CompositeSpec as Composite
 
+from common.pocat_defs import SCALAR_PROMPT_FEATURE_DIM
+
 from common.pocat_defs import (
     NODE_TYPE_BATTERY, NODE_TYPE_IC, NODE_TYPE_LOAD,
     FEATURE_DIM, FEATURE_INDEX
@@ -35,8 +37,13 @@ class PocatEnv(EnvBase):
                 shape=(num_nodes, FEATURE_DIM),
                 dtype=torch.float32,
             ),
-            "prompt_features": Unbounded(
-                shape=(5,), # ambient_temp, max_sleep_current, current_margin, thermal_margin_percent, power_sequence_count
+            # 💡 수정: prompt_features를 두 종류로 나눔
+            "scalar_prompt_features": Unbounded(
+                shape=(SCALAR_PROMPT_FEATURE_DIM,),
+                dtype=torch.float32,
+            ),
+            "matrix_prompt_features": Unbounded(
+                shape=(num_nodes, num_nodes),
                 dtype=torch.float32,
             ),
             "adj_matrix": Unbounded(
@@ -76,6 +83,8 @@ class PocatEnv(EnvBase):
             dtype=torch.long,
         )
         
+        # 보상(Reward) 스펙 정의
+        self.reward_spec = Unbounded(shape=(1,))
         # 보상(Reward) 스펙 정의
         self.reward_spec = Unbounded(shape=(1,))
 
@@ -148,7 +157,8 @@ class PocatEnv(EnvBase):
         # --- 💡 1. Trajectory 기반 상태(state) 재정의 ---
         reset_td = TensorDict({
             "nodes": td["nodes"],
-            "prompt_features": td["prompt_features"],
+            "scalar_prompt_features": td["scalar_prompt_features"],
+            "matrix_prompt_features": td["matrix_prompt_features"],
             "adj_matrix": torch.zeros(batch_size, num_nodes, num_nodes, dtype=torch.bool, device=self.device),
             "main_tree_mask": torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device),
             "ic_current_draw": torch.zeros(batch_size, num_nodes, device=self.device),

@@ -31,6 +31,9 @@ def main(args):
     )
     # --- 수정 완료 ---
 
+    # 💡 model_params에 num_nodes 추가
+    args.model_params['num_nodes'] = env.generator.num_nodes    
+    
     trainer = PocatTrainer(args, env, device)
 
     if args.test_only:

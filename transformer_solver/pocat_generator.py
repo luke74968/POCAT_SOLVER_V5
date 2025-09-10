@@ -2,7 +2,7 @@
 import json
 import torch
 from tensordict import TensorDict
-import copy # 💡 deepcopy를 위해 import
+import copy
 from typing import Dict, Any, List, Tuple
 
 from dataclasses import asdict
@@ -10,7 +10,7 @@ from common.pocat_preprocess import prune_dominated_ic_instances
 from common.pocat_classes import PowerIC, LDO, BuckConverter, Load, Battery
 from common.pocat_defs import (
     PocatConfig, NODE_TYPE_BATTERY, NODE_TYPE_IC, NODE_TYPE_LOAD,
-    FEATURE_DIM, FEATURE_INDEX
+    FEATURE_DIM, FEATURE_INDEX, SCALAR_PROMPT_FEATURE_DIM
 )
 
 def calculate_derated_current_limit(ic: PowerIC, constraints: Dict[str, Any]) -> float:
@@ -159,22 +159,32 @@ class PocatGenerator:
         node_features = self._create_feature_tensor()
         constraints = self.config.constraints
         
-        # --- 👇 [핵심] 프롬프트 피처 생성 로직 수정 ---
-        prompt_list = [
-            constraints.get("ambient_temperature", 25.0),
-            constraints.get("max_sleep_current", 0.0),
-            constraints.get("current_margin", 0.0),
-            constraints.get("thermal_margin_percent", 0.0),
-            len(constraints.get("power_sequences", [])) # 시퀀스 규칙의 개수를 피처로 사용
-        ]
+        # --- 👇 [핵심] 프롬프트 피처를 스칼라와 행렬로 분리하여 생성 ---
         
-        prompt_features = torch.tensor(prompt_list, dtype=torch.float32)
+        # 2. 시퀀스 제약 조건 행렬 생성 (num_nodes x num_nodes 차원)
+        matrix_prompt_features = torch.zeros(self.num_nodes, self.num_nodes, dtype=torch.float32)
+        node_name_to_idx = {name: i for i, name in enumerate(self.config.node_names)}
+        
+        for seq in constraints.get("power_sequences", []):
+            if seq.get("f") == 1:
+                j_name, k_name = seq['j'], seq['k']
+                if j_name in node_name_to_idx and k_name in node_name_to_idx:
+                    j_idx = node_name_to_idx[j_name]
+                    k_idx = node_name_to_idx[k_name]
+                    matrix_prompt_features[j_idx, k_idx] = 1.0
+        
         # --- 수정 완료 ---
 
+        # 배치 크기만큼 확장
         node_features = node_features.unsqueeze(0).expand(batch_size, -1, -1)
-        prompt_features = prompt_features.unsqueeze(0).expand(batch_size, -1)
+        scalar_prompt_features = scalar_prompt_features.unsqueeze(0).expand(batch_size, -1)
+        matrix_prompt_features = matrix_prompt_features.unsqueeze(0).expand(batch_size, -1, -1)
         
         return TensorDict(
-            { "nodes": node_features, "prompt_features": prompt_features },
+            {
+                "nodes": node_features, 
+                "scalar_prompt_features": scalar_prompt_features,
+                "matrix_prompt_features": matrix_prompt_features
+            },
             batch_size=[batch_size],
         )
