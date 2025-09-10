@@ -160,7 +160,15 @@ class PocatGenerator:
         constraints = self.config.constraints
         
         # --- 👇 [핵심] 프롬프트 피처를 스칼라와 행렬로 분리하여 생성 ---
-        
+        # 1. 스칼라 피처 생성 (4차원)
+        scalar_prompt_list = [
+            constraints.get("ambient_temperature", 25.0),
+            constraints.get("max_sleep_current", 0.0),
+            constraints.get("current_margin", 0.0),
+            constraints.get("thermal_margin_percent", 0.0)
+        ]
+        scalar_prompt_features = torch.tensor(scalar_prompt_list, dtype=torch.float32)
+
         # 2. 시퀀스 제약 조건 행렬 생성 (num_nodes x num_nodes 차원)
         matrix_prompt_features = torch.zeros(self.num_nodes, self.num_nodes, dtype=torch.float32)
         node_name_to_idx = {name: i for i, name in enumerate(self.config.node_names)}
