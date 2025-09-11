@@ -209,7 +209,10 @@ class PocatEnv(EnvBase):
 
         if b_phase1.numel() > 0:  # Trajectory 구축 단계
             child_idx, parent_idx = action[b_phase1, 0], action[b_phase1, 1]
-            next_obs["adj_matrix"][b_phase1[:, None], parent_idx, child_idx] = True
+            next_obs["adj_matrix"][b_phase1, parent_idx, child_idx] = True
+            #assert parent_idx.shape == child_idx.shape == b_phase1.shape, \
+            #"shape mismatch in (b, parent, child) triplets"
+
 
             # [수정] 전류 전파 로직 구현
             path_nodes_mask = self._trace_path_batch(b_phase1, child_idx, next_obs["adj_matrix"])
