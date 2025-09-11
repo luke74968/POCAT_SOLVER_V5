@@ -311,18 +311,26 @@ class PocatModel(nn.Module):
         decoding_step = 0
         while not td["done"].all():
             decoding_step += 1
-            if pbar:
-                num_connected_loads = num_total_loads - td["unconnected_loads_mask"][0].sum().item()
-                current_node_idx = td["trajectory_head"][0].item()
-                current_node_name = node_names[current_node_idx] if current_node_idx != -1 else "N/A"
 
-                detail_msg = f"◀ Decoding ({num_connected_loads}/{num_total_loads} Loads, Step {decoding_step}: Conn. '{current_node_name}')"
-                desc = f"{pbar.desc.split(' | ')[0]} | {status_msg} | ▶ Encoding (done) | {detail_msg}"
-                pbar.set_description(desc)
-                if log_fn: log_fn(desc)
+            # --- 💡 1. 현재 상태를 명확하게 로깅 ---
+            num_connected_loads = num_total_loads - td["unconnected_loads_mask"][0].sum().item()
+            phase = td["decoding_phase"][0, 0].item()
+
+
+            state_description = ""
+            if phase == 0:
+                state_description = "Select New Load"
+            else: # phase == 1
+                current_node_idx = td["trajectory_head"][0].item()
+                if current_node_idx != -1:
+                    current_node_name = node_names[current_node_idx]
+                    state_description = f"Find Parent for '{current_node_name}'"
+
+            if pbar and log_fn:
+                # 상태 로그는 파일에만 기록 (pbar에서는 행동 위주로 표시)
+                log_fn(f"{base_desc} | ... | Decoding (Step {decoding_step} State): {state_description}")
 
             mask = env.get_action_mask(td)
-            phase = td["decoding_phase"][0, 0].item()
 
             if phase == 0:
                 # --- Phase 0: 다음으로 연결할 Load 선택 ---
@@ -352,21 +360,25 @@ class PocatModel(nn.Module):
                 selected_parent_idx = Categorical(probs=log_prob.exp()).sample() if decode_type == 'sampling' else log_prob.argmax(dim=-1)
                 action = torch.stack([trajectory_head_idx, selected_parent_idx], dim=1)
                 log_prob_val = log_prob.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
-            # 💡 [핵심 수정] 행동 결정 직후, 상세 로그 업데이트
+            
+            # 💡 --- 2. 결정된 행동을 명확하게 로깅 ---
             if pbar:
                 child_idx = action[0, 0].item()
-                parent_idx = action[0, 1].item()
                 child_name = node_names[child_idx]
-
-                if phase == 0: # 새로운 Load 선택 단계
-                    detail_msg = f"◀ Decoding ({num_connected_loads}/{num_total_loads} Loads, Step {decoding_step}): Start with Load '{child_name}'"
-                else: # 부모 연결 단계
+                action_description = ""
+                if phase == 0:
+                    action_description = f"Started new path with Load '{child_name}'"
+                else:
+                    parent_idx = action[0, 1].item()
                     parent_name = node_names[parent_idx]
-                    detail_msg = f"◀ Decoding ({num_connected_loads}/{num_total_loads} Loads, Step {decoding_step}): Conn. '{child_name}' to '{parent_name}'"
+                    action_description = f"Connected '{child_name}' to '{parent_name}'"
                 
+                detail_msg = f"◀ Decoding ({num_connected_loads}/{num_total_loads} Loads, Step {decoding_step}): {action_description}"
                 desc = f"{base_desc} | {status_msg} | ▶ Encoding (done) | {detail_msg}"
                 pbar.set_description(desc)
                 if log_fn: log_fn(desc)
+
+
             # --- 5. 환경 업데이트 및 다음 스텝 준비 ---
             td.set("action", action)
             output_td = env.step(td)
