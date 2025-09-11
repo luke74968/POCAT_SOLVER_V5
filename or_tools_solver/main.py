@@ -58,7 +58,12 @@ def main():
     pruned_count = len(candidate_ics)
     print(f"   - {original_count - pruned_count}개의 지배되는 IC 인스턴스 제거 완료!")
     print(f"   - 남은 후보 IC 인스턴스: {pruned_count}개")
-
+    # --- 💡 [핵심 수정] 최종 인스턴스 목록 로그 출력 ---
+    print("\n--- ✅ 최종 후보 IC 인스턴스 목록 ---")
+    for ic_dict in sorted(pruned_ics_dicts, key=lambda x: x['name']):
+        print(f"   - {ic_dict['name']}")
+    print("------------------------------------")
+    # --- 수정 완료 ---
     # --- 💡 결과 표시 방법 개선 ---
     """
     if dominance_map:
