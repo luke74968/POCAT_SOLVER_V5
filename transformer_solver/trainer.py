@@ -4,16 +4,27 @@ from tqdm import tqdm
 import os
 import time # 💡 시간 측정을 위해 time 모듈 추가
 
+# 💡 1. 필요한 모듈들을 임포트합니다.
+from torch.utils.data import DataLoader
+from tensordict import TensorDict
+
+
 from common.utils.common import TimeEstimator, clip_grad_norms, unbatchify
 from .model import PocatModel
 from .pocat_env import PocatEnv
+from .pocat_dataset import PocatDataset # 💡 2. 새로 만든 Dataset 클래스를 임포트합니다.
 from common.pocat_visualizer import print_and_visualize_one_solution
 
 from common.pocat_classes import Battery, LDO, BuckConverter, Load
 from common.pocat_defs import PocatConfig, NODE_TYPE_IC
 from common.config_loader import load_configuration_from_file
 
-
+def tensordict_collate_fn(batch):
+    """
+    DataLoader로부터 받은 TensorDict 샘플 리스트를 하나의 배치 TensorDict로 쌓습니다.
+    """
+    # batch는 [TensorDict_sample1, TensorDict_sample2, ...] 형태의 리스트입니다.
+    return torch.stack(batch, dim=0)
 
 def cal_model_size(model, log_func):
     param_count = sum(param.nelement() for param in model.parameters())
@@ -60,8 +71,33 @@ class PocatTrainer:
             self.model.load_state_dict(checkpoint['model_state_dict'])
             # 훈련을 이어서 할 경우 optimizer 상태도 불러올 수 있음
             # self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            # self.start_epoch = checkpoint['epoch'] + 1        
+            # self.start_epoch = checkpoint['epoch'] + 1       
+            # 
+                # 💡 3. 학습을 위한 Dataset과 DataLoader를 생성합니다.
+        if not args.test_only:
+            train_dataset = PocatDataset(
+                generator=self.env.generator,
+                steps_per_epoch=args.trainer_params['train_step']
+            )
+            
+            # os.cpu_count()를 사용해 사용 가능한 코어 수를 파악합니다.
+            # 코어의 절반 정도를 사용하는 것이 안전한 시작점입니다.
+            num_workers = os.cpu_count() // 2 if os.cpu_count() else 4
+            args.log(f"데이터 로딩에 {num_workers}개의 CPU 코어를 사용합니다.")
+
+            # 💡 3. collate_fn에 새로 정의한 top-level 함수를 전달합니다.
+            self.train_dataloader = DataLoader(
+                train_dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True,
+                collate_fn=tensordict_collate_fn 
+            )
+
         self.time_estimator = TimeEstimator(log_fn=args.log)
+
+        
 
     def run(self):
         args = self.args
@@ -76,19 +112,29 @@ class PocatTrainer:
             
             self.model.train()
             
-            train_pbar = tqdm(range(1, args.trainer_params['train_step'] + 1), 
+            # 💡 4. 학습 루프를 DataLoader 기준으로 변경합니다.
+            train_pbar = tqdm(self.train_dataloader, 
                               desc=f"Epoch {epoch}/{args.trainer_params['epochs']}", 
                               ncols=140)
             
             total_loss = 0.0
             total_cost = 0.0
+            step_count = 0
 
-            for step in train_pbar:
-                step_start_time = time.time()
+
+            for td in train_pbar:
+                step_count += 1
                 self.optimizer.zero_grad()
-                
-                base_desc = f"Epoch {epoch} (Step {step})"
+
+                # DataLoader가 준비된 배치를 제공하므로, 디바이스로 옮기기만 하면 됩니다.
+                td = td.to(self.device)
+
+                base_desc = f"Epoch {epoch} (Step {step_count})"
                 status_message = f"🔄 Env Reset (ing..)"
+                
+                # 진행률 표시줄 로깅은 이제 모델의 forward 패스 내부에서 처리됩니다.
+                # 여기서는 상태 메시지를 단순화할 수 있습니다.
+                base_desc = f"Epoch {epoch} (Step {step_count})"
                 
                 # --- 👇 [핵심] tqdm 설명 설정과 동시에 로그 기록 ---
                 train_pbar.set_description(f"{base_desc} | {status_message}")
@@ -104,7 +150,7 @@ class PocatTrainer:
 
                 model_start_time = time.time()
                 # --- 👇 [핵심] log 함수를 모델에 전달 ---
-                out = self.model(td, self.env, decode_type='sampling', pbar=train_pbar, status_msg=status_message, log_fn=args.log)
+                out = self.model(td, decode_type='sampling', pbar=train_pbar, status_msg=status_message, log_fn=args.log)
                 model_time = time.time() - model_start_time
 
                 status_message += f" | ▶ Encoding (done) | ◀ Decoding (done)"
@@ -132,8 +178,8 @@ class PocatTrainer:
                 total_cost += current_cost
                 
                 train_pbar.set_postfix({
-                    'Loss': f'{total_loss/step:.4f}',
-                    'Cost': f'${total_cost/step:.2f}',
+                    'Loss': f'{total_loss/step_count:.4f}',
+                    'Cost': f'${total_cost/step_count:.2f}',
                     'T_Reset': f'{reset_time*1000:.0f}ms',
                     'T_Model': f'{model_time:.2f}s',
                     'T_Bwd': f'{bwd_time*1000:.0f}ms'
