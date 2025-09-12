@@ -220,7 +220,12 @@ class PocatEnv(EnvBase):
 
             # 2. 현재 만들고 있는 경로에 포함된 노드는 부모가 될 수 없음 (사이클 방지)
             current_path_mask = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"])
-            can_be_parent &= ~current_path_mask
+            # 자식 노드의 모든 후손도 배제해야 사이클이 발생하지 않습니다.
+            descendant_mask = self._trace_path_batch(
+                b_idx, child_indices, td["adj_matrix"].transpose(-1, -2)
+            )
+            path_mask = current_path_mask | descendant_mask
+            can_be_parent &= ~path_mask
 
 
             # 3. 전압 호환성 검사
@@ -274,8 +279,11 @@ class PocatEnv(EnvBase):
             is_load = (node_types == NODE_TYPE_LOAD)
             can_be_parent &= ~is_load.unsqueeze(0)
 
-            mask[b_idx, :, child_indices] = can_be_parent
+
+            mask[b_idx, child_indices, :] = can_be_parent
+            
         return mask
+
 
     
     def get_reward(self, td: TensorDict, timed_out: torch.Tensor) -> torch.Tensor:
