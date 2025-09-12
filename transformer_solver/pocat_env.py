@@ -26,100 +26,35 @@ class PocatEnv(EnvBase):
         self._make_spec()
         self._set_seed(None) # 생성자에서 호출은 되어 있으나, 아래에 메소드 정의가 필요합니다.
 
-    # --- 👇 1. 누락된 _make_spec 메소드 추가 ---
     def _make_spec(self):
         """환경의 observation, action, reward 스펙을 정의합니다."""
         num_nodes = self.generator.num_nodes
         
-        # 관측 공간(Observation Space) 정의
         self.observation_spec = Composite({
-            "nodes": Unbounded(
-                shape=(num_nodes, FEATURE_DIM),
-                dtype=torch.float32,
-            ),
-            # 💡 수정: prompt_features를 두 종류로 나눔
-            "scalar_prompt_features": Unbounded(
-                shape=(SCALAR_PROMPT_FEATURE_DIM,),
-                dtype=torch.float32,
-            ),
-            "matrix_prompt_features": Unbounded(
-                shape=(num_nodes, num_nodes),
-                dtype=torch.float32,
-            ),
-            "adj_matrix": Unbounded(
-                shape=(num_nodes, num_nodes),
-                dtype=torch.bool,
-            ),
-            "main_tree_mask": Unbounded(
-                shape=(num_nodes,),
-                dtype=torch.bool,
-            ),
-            "ic_current_draw": Unbounded(
-                shape=(num_nodes,),
-                dtype=torch.float32,
-            ),
-            "decoding_phase": Categorical(
-                shape=(1,),
-                n=2, # 0: 새 Load 선택, 1: Trajectory 구축
-                dtype=torch.long,
-            ),
-            "trajectory_head": UnboundedDiscrete(
-                shape=(1,),
-                dtype=torch.long,
-            ),
-            "unconnected_loads_mask": Unbounded(
-                shape=(num_nodes,),
-                dtype=torch.bool,
-            ),
-            "step_count": UnboundedDiscrete(
-                shape=(1,),
-                dtype=torch.long,
-            ),
+            "nodes": Unbounded(shape=(num_nodes, FEATURE_DIM), dtype=torch.float32),
+            "scalar_prompt_features": Unbounded(shape=(SCALAR_PROMPT_FEATURE_DIM,), dtype=torch.float32),
+            "matrix_prompt_features": Unbounded(shape=(num_nodes, num_nodes), dtype=torch.float32),
+            "adj_matrix": Unbounded(shape=(num_nodes, num_nodes), dtype=torch.bool),
+            "main_tree_mask": Unbounded(shape=(num_nodes,), dtype=torch.bool),
+            "ic_current_draw": Unbounded(shape=(num_nodes,), dtype=torch.float32),
+            "decoding_phase": Categorical(shape=(1,), n=2, dtype=torch.long),
+            "trajectory_head": UnboundedDiscrete(shape=(1,), dtype=torch.long),
+            "unconnected_loads_mask": Unbounded(shape=(num_nodes,), dtype=torch.bool),
+            "step_count": UnboundedDiscrete(shape=(1,), dtype=torch.long),
         })
         
-        # 행동 공간(Action Space) 정의: [자식 노드, 부모 노드]
-        self.action_spec = UnboundedDiscrete(
-            shape=(2,),
-            dtype=torch.long,
-        )
-        
-        # 보상(Reward) 스펙 정의
-        self.reward_spec = Unbounded(shape=(1,))
-        # 보상(Reward) 스펙 정의
+        self.action_spec = UnboundedDiscrete(shape=(2,), dtype=torch.long)
         self.reward_spec = Unbounded(shape=(1,))
 
-    # --- 👇 2. 누락된 _set_seed 메소드 추가 ---
     def _set_seed(self, seed: Optional[int] = None):
-        """환경의 랜덤 시드를 설정합니다. (torchrl 필수 구현)"""
-        # 현재 환경은 자체적인 랜덤 요소가 없으므로 특별한 로직은 필요 없습니다.
-        # 하지만 EnvBase를 상속받기 위해 반드시 구현해야 합니다.
         if seed is not None:
             torch.manual_seed(seed)
 
-    # --- 👇 1. 누락되었던 select_start_nodes 메소드 추가 ---
     def select_start_nodes(self, td: TensorDict) -> Tuple[int, torch.Tensor]:
-        """POMO decoding을 위해 시작 노드(모든 Load)를 선택합니다."""
-        # 노드 타입 정보는 배치 내에서 동일하므로 0번 인덱스만 사용합니다.
         node_types = td["nodes"][0, :, :FEATURE_INDEX["node_type"][1]].argmax(-1)
         start_nodes_idx = torch.where(node_types == NODE_TYPE_LOAD)[0]
-        num_starts = len(start_nodes_idx)
-        return num_starts, start_nodes_idx
-
-    # --- 👇 2. 누락되었던 경로 추적 헬퍼 메소드들 추가 ---
-    def _trace_path(self, b_idx: int, start_node: int, adj_matrix: torch.Tensor) -> list[int]:
-        """단일 배치 항목에 대해 start_node에서 시작하는 경로를 역추적하여 노드 인덱스 리스트를 반환합니다."""
-        path = [start_node]
-        current_node = start_node
-        # adj_matrix[b_idx, parent, child] 형태이므로, current_node를 자식으로 갖는 부모를 찾습니다.
-        while True:
-            parents = adj_matrix[b_idx, :, current_node].nonzero(as_tuple=True)[0]
-            if parents.numel() == 0:
-                break
-            parent_node = parents[0].item() # 경로는 하나뿐이라고 가정
-            path.append(parent_node)
-            current_node = parent_node
-        return path
-
+        return len(start_nodes_idx), start_nodes_idx
+    
     def _trace_path_batch(self, b_idx: torch.Tensor, start_nodes: torch.Tensor, adj_matrix: torch.Tensor) -> torch.Tensor:
         """배치 전체에 대해 start_node들의 모든 조상을 찾아 마스크로 반환합니다."""
         num_nodes = adj_matrix.shape[-1]
@@ -193,64 +128,73 @@ class PocatEnv(EnvBase):
         action = td["action"]
         b_idx = torch.arange(td.batch_size[0], device=self.device)
         phase = td["decoding_phase"].squeeze(-1)
-
         next_obs = td.clone()
 
+        # Phase 0: 새 Load 선택
         phase0_mask = phase == 0
-        phase1_mask = phase == 1
-        b_phase0 = b_idx[phase0_mask]
-        b_phase1 = b_idx[phase1_mask]
-
-        if b_phase0.numel() > 0:  # 새 Load 선택 단계
+        if phase0_mask.any():
+            b_phase0 = b_idx[phase0_mask]
             selected_load = action[b_phase0, 0]
             next_obs["trajectory_head"][b_phase0] = selected_load.unsqueeze(-1)
             next_obs["unconnected_loads_mask"][b_phase0, selected_load] = False
-            next_obs["decoding_phase"][b_phase0, 0] = 1  # 다음은 경로 구축 단계로
+            next_obs["decoding_phase"][b_phase0] = 1
 
-        if b_phase1.numel() > 0:  # Trajectory 구축 단계
+        # Phase 1: Trajectory(경로) 구축
+        phase1_mask = phase == 1
+        phase1_mask = phase == 1
+        if phase1_mask.any():
+            b_phase1 = b_idx[phase1_mask]
             child_idx, parent_idx = action[b_phase1, 0], action[b_phase1, 1]
             next_obs["adj_matrix"][b_phase1, parent_idx, child_idx] = True
-            #assert parent_idx.shape == child_idx.shape == b_phase1.shape, \
-            #"shape mismatch in (b, parent, child) triplets"
 
-
-            # [수정] 전류 전파 로직 구현
             path_nodes_mask = self._trace_path_batch(b_phase1, child_idx, next_obs["adj_matrix"])
-            path_nodes_currents = (
-                td["nodes"][b_phase1] * path_nodes_mask.unsqueeze(-1)
-            )[:, :, FEATURE_INDEX["current_active"]]
-
-            for idx, b in enumerate(b_phase1.tolist()):
-                total_child_current = path_nodes_currents[idx].sum()
-                ancestor = parent_idx[idx].item()
-                while ancestor != 0:
-                    next_obs["ic_current_draw"][b, ancestor] += total_child_current
-                    ancestors_of_ancestor = next_obs["adj_matrix"][b, :, ancestor].nonzero(as_tuple=True)[0]
-                    if ancestors_of_ancestor.numel() == 0:
-                        break
-                    ancestor = ancestors_of_ancestor[0].item()
+            path_nodes_currents = (td["nodes"][b_phase1] * path_nodes_mask.unsqueeze(-1))[:, :, FEATURE_INDEX["current_active"]]
+            total_child_currents = path_nodes_currents.sum(dim=1)
+            
+            ancestor_mask = self._trace_path_batch(b_phase1, parent_idx, next_obs["adj_matrix"])
+            battery_mask = torch.zeros_like(ancestor_mask); battery_mask[:, 0] = True
+            ancestor_mask_no_battery = ancestor_mask & ~battery_mask
+            
+            current_draw_update = ancestor_mask_no_battery.float().transpose(-1, -2) @ total_child_currents.float().unsqueeze(-1)
+            next_obs["ic_current_draw"][b_phase1] += current_draw_update.squeeze(-1)
 
             is_parent_in_main_tree = next_obs["main_tree_mask"][b_phase1, parent_idx]
+            
+            b_connected = b_phase1[is_parent_in_main_tree]
+            if b_connected.numel() > 0:
+                child_connected = child_idx[is_parent_in_main_tree]
+                newly_connected_path_mask = self._trace_path_batch(b_connected, child_connected, next_obs["adj_matrix"])
+                next_obs["main_tree_mask"][b_connected] |= newly_connected_path_mask
+                next_obs["decoding_phase"][b_connected] = 0
 
-            for idx, b in enumerate(b_phase1.tolist()):
-                if is_parent_in_main_tree[idx]:
-                    path_nodes_indices = self._trace_path(b, child_idx[idx], next_obs["adj_matrix"])
-                    next_obs["main_tree_mask"][b, path_nodes_indices] = True
-                    if next_obs["unconnected_loads_mask"][b].sum() == 0:
-                        next_obs["done"][b] = True
-                    else:
-                        next_obs["decoding_phase"][b] = 0
-                else:
-                    next_obs["trajectory_head"][b] = parent_idx[idx]
-
+            b_not_connected = b_phase1[~is_parent_in_main_tree]
+            if b_not_connected.numel() > 0:
+                parent_not_connected = parent_idx[~is_parent_in_main_tree]
+                next_obs["trajectory_head"][b_not_connected] = parent_not_connected.unsqueeze(-1)
+        
         next_obs.set("step_count", td["step_count"] + 1)
+
+        # 💡 *** 여기가 핵심 수정 부분입니다 (1/2) ***
+        # 1. 모든 부하가 연결되었는지 확인
+        all_loads_connected = (next_obs["unconnected_loads_mask"].sum(dim=1) == 0)
+        # 2. 현재 새로운 경로를 만들고 있지 않은지 확인 (모든 경로가 주 전력망에 연결되었는지)
+        in_selection_phase = (next_obs["decoding_phase"].squeeze(-1) == 0)
+        # 3. 두 조건을 모두 만족해야 성공적으로 종료
+        done_successfully = all_loads_connected & in_selection_phase
+        
+        # 4. 타임아웃(안전망) 확인
+        max_steps = 2 * self.generator.num_nodes
+        timed_out = (next_obs["step_count"] > max_steps).squeeze(-1)
+        
+        is_done = done_successfully | timed_out
+        next_obs["done"] = is_done.unsqueeze(-1)
         
         return TensorDict({
             "next": next_obs,
-            "reward": self.get_reward(next_obs),
+            "reward": self.get_reward(next_obs, timed_out),
             "done": next_obs["done"],
         }, batch_size=td.batch_size)
-    
+        
     # 💡 *** 여기가 핵심 수정 부분입니다 ***
     def get_action_mask(self, td: TensorDict) -> torch.Tensor:
         batch_size, num_nodes, _ = td["nodes"].shape
@@ -272,9 +216,7 @@ class PocatEnv(EnvBase):
             can_be_parent = torch.ones(len(b_idx), num_nodes, dtype=torch.bool, device=self.device)
             node_types = td["nodes"][0, :, :FEATURE_INDEX["node_type"][1]].argmax(-1)
             
-            # 1. 부하는 부모가 될 수 없음
-            is_load = (node_types == NODE_TYPE_LOAD)
-            can_be_parent &= ~is_load.unsqueeze(0)
+
 
             # 2. 현재 만들고 있는 경로에 포함된 노드는 부모가 될 수 없음 (사이클 방지)
             current_path_mask = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"])
@@ -328,12 +270,15 @@ class PocatEnv(EnvBase):
                 is_head_k_mask = child_indices == k_idx
                 if is_head_k_mask.any():
                     can_be_parent[is_head_k_mask] &= ~ancestors[is_head_k_mask, :, j_idx]
-            
+                        # 1. 부하는 부모가 될 수 없음
+            is_load = (node_types == NODE_TYPE_LOAD)
+            can_be_parent &= ~is_load.unsqueeze(0)
+
             mask[b_idx, :, child_indices] = can_be_parent
         return mask
 
     
-    def get_reward(self, td: TensorDict) -> torch.Tensor:
+    def get_reward(self, td: TensorDict, timed_out: torch.Tensor) -> torch.Tensor:
         """
         Calculates the reward based on the final state of the power tree.
         The reward is the negative of the total cost of used ICs.
@@ -342,19 +287,21 @@ class PocatEnv(EnvBase):
         reward = torch.zeros(td.batch_size[0], device=self.device)
         done = td["done"].squeeze(-1)
         
-        if done.any():
-            # Calculate cost based on the final adjacency matrix
-            is_used_mask = td["adj_matrix"][done].any(dim=1) | td["adj_matrix"][done].any(dim=2)
-            
-            node_costs = td["nodes"][done, :, FEATURE_INDEX["cost"]]
-            ic_mask = td["nodes"][done, :, FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1
-            
+        # 성공적으로 완료된 경우
+        done_success = done & ~timed_out
+        if done_success.any():
+            is_used_mask = td["adj_matrix"][done_success].any(dim=1) | td["adj_matrix"][done_success].any(dim=2)
+            node_costs = td["nodes"][done_success, :, FEATURE_INDEX["cost"]]
+            ic_mask = td["nodes"][done_success, :, FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1
             used_ic_mask = is_used_mask & ic_mask
             total_cost = (node_costs * used_ic_mask).sum(dim=-1)
-            reward[done] = -total_cost
+            reward[done_success] = -total_cost
+
+        # 💡 *** 여기가 핵심 수정 부분입니다 (2/2) ***
+        # 시간 초과로 실패한 경우 패널티를 부여합니다.
+        if timed_out.any():
+            # 연결하지 못한 Load의 수만큼 큰 패널티를 부여합니다.
+            unconnected_loads = td["unconnected_loads_mask"][timed_out].sum(dim=1).float()
+            reward[timed_out] -= unconnected_loads * 10.0 # 패널티 값
             
-            # (Optional) Add penalty for violating sleep current constraint
-            max_sleep_current = self.generator.config.constraints.get("max_sleep_current", 0.0)
-            if max_sleep_current > 0:
-                loads_info = self.generator.config.loads
         return reward
