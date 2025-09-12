@@ -22,7 +22,6 @@ def setup_logger(result_dir):
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    #device = 'cpu'
     args.log(f"Using device: {device}")
     
     # --- 👇 1. PocatEnv 생성 시 instance_repeats 인자 제거 ---
