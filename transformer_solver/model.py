@@ -7,10 +7,8 @@ from tensordict import TensorDict
 
 from common.pocat_defs import FEATURE_DIM, FEATURE_INDEX, NODE_TYPE_BATTERY, NODE_TYPE_IC, NODE_TYPE_LOAD
 from common.utils.common import batchify
-# 💡 PocatEnv는 더 이상 forward 내부에서 직접 사용되지 않습니다.
-# from .pocat_env import PocatEnv 
 
-# ... (RMSNorm, Normalization, EncoderLayer 등 다른 클래스는 이전과 동일하게 유지) ...
+# --- 이전과 동일한 클래스 정의 (Encoder, Decoder 등) ---
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -61,7 +59,6 @@ def reshape_by_heads(qkv: torch.Tensor, head_num: int) -> torch.Tensor:
 
 def multi_head_attention(q, k, v, attention_mask=None, sparse_type=None):
     batch_s, head_num, n, key_dim = q.shape
-
     score = torch.matmul(q, k.transpose(2, 3))
     score_scaled = score / (key_dim ** 0.5)
     
@@ -70,10 +67,8 @@ def multi_head_attention(q, k, v, attention_mask=None, sparse_type=None):
         
     if sparse_type == 'topk':
         seq_len = score_scaled.size(-1)
-        k_for_topk = max(1, seq_len // 2) 
-
+        k_for_topk = max(1, seq_len // 2)
         top_k_values, top_k_indices = torch.topk(score_scaled, k=k_for_topk, dim=-1)
-        
         topk_mask = torch.zeros_like(score_scaled, dtype=torch.bool).scatter_(-1, top_k_indices, True)
         attention_weights = score_scaled.masked_fill(~topk_mask, -1e9)
         weights = nn.Softmax(dim=3)(attention_weights)
@@ -222,35 +217,29 @@ class PocatModel(nn.Module):
         self.decoder = PocatDecoder(**model_params)
         self.context_gru = nn.GRUCell(model_params['embedding_dim'] * 2, model_params['embedding_dim'])
 
-    # 💡 1. `env` 인자를 제거하고, forward 메서드 시그니처를 수정합니다.
-    def forward(self, td: TensorDict, decode_type: str = 'greedy', pbar: object = None, status_msg: str = "", log_fn=None):
-        
-        # 💡 2. 디코딩 상태를 저장할 텐서들을 여기서 직접 초기화합니다.
+    def forward(self, td: TensorDict, decode_type: str = 'greedy', pbar: object = None, log_fn=None):
         batch_size, num_nodes, _ = td["nodes"].shape
-        b_idx = torch.arange(batch_size, device=td.device)
+        device = td.device
         
-        adj_matrix = torch.zeros(batch_size, num_nodes, num_nodes, dtype=torch.bool, device=td.device)
-        main_tree_mask = torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=td.device)
-        main_tree_mask[:, 0] = True # 배터리는 항상 메인 트리에 포함
-        ic_current_draw = torch.zeros(batch_size, num_nodes, device=td.device)
-        decoding_phase = torch.zeros(batch_size, 1, dtype=torch.long, device=td.device)
-        trajectory_head = torch.full((batch_size, 1), -1, dtype=torch.long, device=td.device)
+        adj_matrix = torch.zeros(batch_size, num_nodes, num_nodes, dtype=torch.bool, device=device)
+        main_tree_mask = torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=device)
+        main_tree_mask[:, 0] = True
+        ic_current_draw = torch.zeros(batch_size, num_nodes, device=device)
+        decoding_phase = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+        trajectory_head = torch.full((batch_size, 1), -1, dtype=torch.long, device=device)
         
         node_types = td["nodes"][0, :, :FEATURE_INDEX["node_type"][1]].argmax(-1)
         is_load = node_types == NODE_TYPE_LOAD
         unconnected_loads_mask = is_load.unsqueeze(0).expand(batch_size, -1)
         
-        done = torch.zeros(batch_size, 1, dtype=torch.bool, device=td.device)
+        done = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)
 
-        # --- 인코딩 ---
         prompt_embedding = self.prompt_net(td["scalar_prompt_features"], td["matrix_prompt_features"])
         encoded_nodes = self.encoder(td, prompt_embedding)
 
-        # --- POMO 준비 ---
         start_nodes_idx = torch.where(is_load)[0]
         num_starts = len(start_nodes_idx)
         
-        # POMO를 위해 모든 상태 텐서를 확장합니다.
         td = batchify(td, num_starts)
         encoded_nodes = batchify(encoded_nodes, num_starts)
         adj_matrix = batchify(adj_matrix, num_starts)
@@ -265,41 +254,52 @@ class PocatModel(nn.Module):
         context_embedding = encoded_nodes.mean(dim=1)
         log_probs, actions = [], []
         
-        # --- 첫 번째 액션(Load 선택) 및 상태 업데이트 ---
         action_part1 = start_nodes_idx.repeat(batch_size)
-        action_part2 = torch.zeros_like(action_part1)
-        action = torch.stack([action_part1, action_part2], dim=1)
+        action = torch.stack([action_part1, torch.zeros_like(action_part1)], dim=1)
         
         trajectory_head = action_part1.unsqueeze(-1)
         unconnected_loads_mask[torch.arange(expanded_batch_size), action_part1] = False
         decoding_phase[:, 0] = 1
 
         actions.append(action)
-        log_probs.append(torch.zeros(expanded_batch_size, device=td.device))
+        log_probs.append(torch.zeros(expanded_batch_size, device=device))
 
-        # --- 디코딩 루프 시작 ---
-        for step in range(num_nodes * 2): # 최대 스텝 수 제한
+        for _ in range(num_nodes * 2):
             if done.all():
                 break
 
-            # 💡 3. 마스크 계산 로직을 여기에 통합 (벡터화)
-            mask = torch.zeros(expanded_batch_size, num_nodes, num_nodes, dtype=torch.bool, device=td.device)
+            mask = torch.zeros(expanded_batch_size, num_nodes, num_nodes, dtype=torch.bool, device=device)
             phase = decoding_phase.squeeze(-1)
-            b_idx_loop = torch.arange(expanded_batch_size, device=td.device)
+            b_idx_loop = torch.arange(expanded_batch_size, device=device)
             
-            # Phase 0: 새 Load 선택
             phase0_mask = (phase == 0)
-            if phase0_mask.any():
-                mask[phase0_mask, :, 0] = unconnected_loads_mask[phase0_mask]
-
-            # Phase 1: 부모 선택
             phase1_mask = (phase == 1)
+
+            # 💡 --- 핵심 수정 시작 ---
+            # 1. 각 Phase별로 액션과 로그 확률을 저장할 변수를 분리합니다.
+            action_p0, action_p1 = None, None
+            log_prob_val_p0, log_prob_val_p1 = None, None
+
+            # 2. 각 if 블록 안에서 계산을 수행합니다.
+            if phase0_mask.any():
+                b_p0 = b_idx_loop[phase0_mask]
+                main_tree_nodes = encoded_nodes[b_p0] * main_tree_mask[b_p0].unsqueeze(-1)
+                context = main_tree_nodes.sum(1) / (main_tree_mask[b_p0].sum(1, keepdim=True) + 1e-9)
+                mask_for_load_select = unconnected_loads_mask[b_p0]
+                
+                scores = self.decoder(context.unsqueeze(1), encoded_nodes[b_p0], mask_for_load_select.unsqueeze(1), 0)
+                scores.masked_fill_(~mask_for_load_select, -1e9)
+                
+                log_prob = F.log_softmax(scores, dim=-1)
+                selected_load = Categorical(probs=log_prob.exp()).sample() if decode_type == 'sampling' else log_prob.argmax(dim=-1)
+                action_p0 = torch.stack([selected_load, torch.zeros_like(selected_load)], dim=1)
+                log_prob_val_p0 = log_prob.gather(1, selected_load.unsqueeze(-1)).squeeze(-1)
+
             if phase1_mask.any():
                 b_p1 = b_idx_loop[phase1_mask]
                 child_indices = trajectory_head[b_p1].squeeze(-1)
                 
                 can_be_parent = ~is_load.unsqueeze(0).expand(len(b_p1), -1)
-                
                 child_vin_min = td["nodes"][b_p1, child_indices, FEATURE_INDEX["vin_min"]]
                 child_vin_max = td["nodes"][b_p1, child_indices, FEATURE_INDEX["vin_max"]]
                 parent_vout_min = td["nodes"][b_p1, :, FEATURE_INDEX["vout_min"]]
@@ -307,85 +307,64 @@ class PocatModel(nn.Module):
                 is_voltage_compatible = (parent_vout_min <= child_vin_max.unsqueeze(1)) & \
                                         (parent_vout_max >= child_vin_min.unsqueeze(1))
                 can_be_parent &= is_voltage_compatible
-                
-                # 전류 한계 체크 (간소화된 버전)
-                # 실제로는 경로 전체 전류를 계산해야 하지만, 일단 가장 간단한 버전으로 구현
-                child_current = td["nodes"][b_p1, child_indices, FEATURE_INDEX["current_active"]]
-                prospective_draw = ic_current_draw[b_p1] + child_current.unsqueeze(1)
-                parent_limits = td["nodes"][b_p1, :, FEATURE_INDEX["i_limit"]]
-                can_be_parent &= (prospective_draw <= parent_limits) | (parent_limits == 0)
-
-                # 자신을 부모로 선택하는 것 방지
                 can_be_parent[torch.arange(len(b_p1)), child_indices] = False
                 
-                mask[b_p1, :, child_indices] = can_be_parent
+                head_emb = encoded_nodes[b_p1, child_indices]
+                context = torch.cat([context_embedding[b_p1], head_emb], dim=1)
                 
-            # --- 디코더 호출 ---
-            if phase0_mask.any():
-                main_tree_nodes = encoded_nodes[phase0_mask] * main_tree_mask[phase0_mask].unsqueeze(-1)
-                context = main_tree_nodes.sum(1) / (main_tree_mask[phase0_mask].sum(1, keepdim=True) + 1e-9)
-                mask_for_load_select = mask[phase0_mask, :, 0]
-                scores = self.decoder(context.unsqueeze(1), encoded_nodes[phase0_mask], mask_for_load_select.unsqueeze(1), 0)
-                scores.masked_fill_(~mask_for_load_select, -1e9)
-                
-                log_prob = F.log_softmax(scores, dim=-1)
-                selected_node = Categorical(probs=log_prob.exp()).sample() if decode_type == 'sampling' else log_prob.argmax(dim=-1)
-                action = torch.stack([selected_node, torch.zeros_like(selected_node)], dim=1)
-                log_prob_val = log_prob.gather(1, selected_node.unsqueeze(-1)).squeeze(-1)
-
-            if phase1_mask.any():
-                trajectory_head_idx = trajectory_head[phase1_mask].squeeze(-1)
-                head_emb = encoded_nodes[phase1_mask, trajectory_head_idx]
-                context = torch.cat([context_embedding[phase1_mask], head_emb], dim=1)
-                
-                mask_for_parent_select = mask[phase1_mask, :, trajectory_head_idx]
-                scores = self.decoder(context.unsqueeze(1), encoded_nodes[phase1_mask], mask_for_parent_select.unsqueeze(1), 1)
+                mask_for_parent_select = can_be_parent
+                scores = self.decoder(context.unsqueeze(1), encoded_nodes[b_p1], mask_for_parent_select.unsqueeze(1), 1)
                 scores.masked_fill_(~mask_for_parent_select, -1e9)
                 
                 log_prob = F.log_softmax(scores, dim=-1)
                 selected_parent_idx = Categorical(probs=log_prob.exp()).sample() if decode_type == 'sampling' else log_prob.argmax(dim=-1)
-                action = torch.stack([trajectory_head_idx, selected_parent_idx], dim=1)
-                log_prob_val = log_prob.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
+                action_p1 = torch.stack([child_indices, selected_parent_idx], dim=1)
+                log_prob_val_p1 = log_prob.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
 
-            # --- 상태 업데이트 로직 통합 ---
-            full_action = torch.zeros_like(actions[0])
-            full_log_prob = torch.zeros_like(log_probs[0])
+            # 3. 계산이 끝난 후, 결과를 전체 텐서에 합칩니다.
+            full_action = torch.zeros(expanded_batch_size, 2, dtype=torch.long, device=device)
+            full_log_prob = torch.zeros(expanded_batch_size, device=device)
+            
             if phase0_mask.any():
-                full_action[phase0_mask] = action
-                full_log_prob[phase0_mask] = log_prob_val
+                full_action[phase0_mask] = action_p0
+                full_log_prob[phase0_mask] = log_prob_val_p0
             if phase1_mask.any():
-                full_action[phase1_mask] = action
-                full_log_prob[phase1_mask] = log_prob_val
+                full_action[phase1_mask] = action_p1
+                full_log_prob[phase1_mask] = log_prob_val_p1
 
-            # Phase 0 액션에 대한 상태 업데이트
+            # --- 상태 업데이트 ---
             if phase0_mask.any():
                 selected_load = full_action[phase0_mask, 0]
                 trajectory_head[phase0_mask] = selected_load.unsqueeze(-1)
                 unconnected_loads_mask[phase0_mask, selected_load] = False
                 decoding_phase[phase0_mask] = 1
 
-            # Phase 1 액션에 대한 상태 업데이트
             if phase1_mask.any():
                 child_idx, parent_idx = full_action[phase1_mask, 0], full_action[phase1_mask, 1]
                 adj_matrix[phase1_mask, parent_idx, child_idx] = True
 
                 is_parent_in_main_tree = main_tree_mask[phase1_mask, parent_idx]
                 
-                # 경로가 메인 트리에 합류된 경우
                 b_merged = torch.where(phase1_mask)[0][is_parent_in_main_tree]
                 if b_merged.numel() > 0:
-                    decoding_phase[b_merged] = 0 # 다음 스텝은 새 Load 선택
-                    # 경로 전체를 메인 트리에 추가 (단순화된 버전)
-                    # 실제로는 재귀적으로 모든 조상을 찾아야 함
-                    main_tree_mask[b_merged, child_idx[is_parent_in_main_tree]] = True
-                    main_tree_mask[b_merged, parent_idx[is_parent_in_main_tree]] = True
-
-                # 경로가 아직 연결되지 않은 경우
+                    decoding_phase[b_merged] = 0
+                    
+                    # 경로 전체를 메인 트리에 추가 (재귀적 탐색 대신 행렬 곱셈 사용)
+                    path_to_merge = torch.zeros_like(main_tree_mask[b_merged])
+                    path_to_merge[torch.arange(len(b_merged)), child_idx[is_parent_in_main_tree]] = True
+                    adj_b = adj_matrix[b_merged]
+                    for _ in range(num_nodes):
+                         new_parents = (adj_b.float().transpose(1,2) @ path_to_merge.float().unsqueeze(-1)).squeeze(-1) > 0
+                         if (new_parents & ~path_to_merge).sum() == 0: break
+                         path_to_merge |= new_parents
+                    main_tree_mask[b_merged] |= path_to_merge
+                    
                 b_unmerged = torch.where(phase1_mask)[0][~is_parent_in_main_tree]
                 if b_unmerged.numel() > 0:
                     trajectory_head[b_unmerged] = parent_idx[~is_parent_in_main_tree].unsqueeze(-1)
             
-            # 완료 조건 체크
+            # 💡 --- 핵심 수정 끝 ---
+            
             done = (unconnected_loads_mask.sum(dim=1) == 0).unsqueeze(-1)
             
             actions.append(full_action)
@@ -394,8 +373,7 @@ class PocatModel(nn.Module):
             child_emb = encoded_nodes[b_idx_loop, full_action[:, 0]]
             parent_emb = encoded_nodes[b_idx_loop, full_action[:, 1]]
             context_embedding = self.context_gru(torch.cat([child_emb, parent_emb], dim=1), context_embedding)
-
-        # --- 최종 보상 계산 ---
+            
         is_used_mask = adj_matrix.any(dim=1) | adj_matrix.any(dim=2)
         node_costs = td["nodes"][:, :, FEATURE_INDEX["cost"]]
         ic_mask = td["nodes"][:, :, FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1
