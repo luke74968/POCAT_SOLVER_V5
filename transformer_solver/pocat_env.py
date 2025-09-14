@@ -212,20 +212,20 @@ class PocatEnv(EnvBase):
             b_idx = torch.where(phase1_mask)[0]
             child_indices = td["trajectory_head"][b_idx].squeeze(-1)
 
-            # can_be_parent 텐서 생성 시 device를 지정합니다.
-            can_be_parent = torch.ones(len(b_idx), num_nodes, dtype=torch.bool, device=self.device)
             node_types = td["nodes"][0, :, :FEATURE_INDEX["node_type"][1]].argmax(-1)
             
 
+            # 1. 기본 자격 정의: 부모는 IC 또는 배터리여야만 함 (Load 원천 배제)
+            parent_candidate_mask = (node_types == NODE_TYPE_IC) | (node_types == NODE_TYPE_BATTERY)
+            can_be_parent = parent_candidate_mask.unsqueeze(0).expand(len(b_idx), -1).clone()
 
-            # 2. 현재 만들고 있는 경로에 포함된 노드는 부모가 될 수 없음 (사이클 방지)
-            current_path_mask = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"])
-            # 자식 노드의 모든 후손도 배제해야 사이클이 발생하지 않습니다.
-            descendant_mask = self._trace_path_batch(
-                b_idx, child_indices, td["adj_matrix"].transpose(-1, -2)
-            )
-            path_mask = current_path_mask | descendant_mask
+            # 2. 사이클 방지: 현재 경로의 조상 및 자손은 부모가 될 수 없음
+            #    자기 자신도 포함하여 확실히 제외합니다.
+            ancestor_mask = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"])
+            descendant_mask = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"].transpose(-1, -2))
+            path_mask = ancestor_mask | descendant_mask
             can_be_parent &= ~path_mask
+
 
 
             # 3. 전압 호환성 검사
@@ -240,10 +240,11 @@ class PocatEnv(EnvBase):
             can_be_parent &= is_voltage_compatible
 
             # 4. 전류 한계 검사
+            current_path_mask = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"])
             path_nodes_currents = (td["nodes"][b_idx, :, FEATURE_INDEX["current_active"]] * current_path_mask).sum(dim=1)
             prospective_draw = td["ic_current_draw"][b_idx] + path_nodes_currents.unsqueeze(1)
             parent_limits = td["nodes"][b_idx, :, FEATURE_INDEX["i_limit"]]
-            can_be_parent &= (prospective_draw <= parent_limits) | (parent_limits == 0) 
+            can_be_parent &= (prospective_draw <= parent_limits) | (parent_limits == 0)
 
             # 5. 기타 제약조건 (Power Sequence, Independent Rail)
             constraints, loads_info, node_names = self.generator.config.constraints, self.generator.config.loads, self.generator.config.node_names

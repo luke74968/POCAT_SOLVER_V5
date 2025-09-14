@@ -88,7 +88,7 @@ def multi_head_attention(q, k, v, attention_mask=None, sparse_type=None):
             attention_mask = attention_mask.unsqueeze(1)
         elif attention_mask.dim() == 2:
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        score_scaled = score_scaled.masked_fill(attention_mask == 0, -1e9)
+        score_scaled = score_scaled.masked_fill(attention_mask == 0, -float('inf'))
 
 
         
@@ -105,7 +105,7 @@ def multi_head_attention(q, k, v, attention_mask=None, sparse_type=None):
         
         # 선택되지 않은 나머지 값들은 -inf로 마스킹
         topk_mask = torch.zeros_like(score_scaled, dtype=torch.bool).scatter_(-1, top_k_indices, True)
-        attention_weights = score_scaled.masked_fill(~topk_mask, -1e9)
+        attention_weights = score_scaled.masked_fill(~topk_mask, -float('inf'))
         weights = nn.Softmax(dim=3)(attention_weights)
     else:
         # Standard (Dense) Attention
@@ -214,7 +214,7 @@ class PocatEncoder(nn.Module):
     def forward(self, td: TensorDict, prompt_embedding: torch.Tensor) -> torch.Tensor:
         node_features = td['nodes']
         batch_size, num_nodes, _ = node_features.shape
-        
+
         # << 수정: 노드 유형에 따라 각기 다른 임베딩 레이어를 적용합니다.
         # 1. 노드 유형 인덱스를 추출합니다.
         node_type_indices = node_features[:, :, FEATURE_INDEX["node_type"][0]:FEATURE_INDEX["node_type"][1]].argmax(dim=-1)
@@ -391,23 +391,33 @@ class PocatModel(nn.Module):
             scores = self.decoder(td, cache)
             mask = env.get_action_mask(td)
 
+            # << 수정: selected_prob 변수를 루프 시작 전에 선언 >>
+            selected_prob = None
+
             if phase == 0:
                 mask_for_load_select = mask[:, :, 0]
-                scores.masked_fill_(~mask_for_load_select, -1e9)
+                scores.masked_fill_(~mask_for_load_select, -float('inf'))
                 log_prob = F.log_softmax(scores, dim=-1)
-                selected_load = Categorical(probs=log_prob.exp()).sample() if decode_type == 'sampling' else log_prob.argmax(dim=-1)
+
+                probs = log_prob.exp()
+                selected_load = Categorical(probs=probs).sample() if decode_type == 'sampling' else probs.argmax(dim=-1)
                 action = torch.stack([selected_load, torch.zeros_like(selected_load)], dim=1)
                 log_prob_val = log_prob.gather(1, selected_load.unsqueeze(-1)).squeeze(-1)
+                selected_prob = probs.gather(1, selected_load.unsqueeze(-1)).squeeze(-1)
+
 
             else: # phase == 1
                 trajectory_head_idx = td["trajectory_head"].squeeze(-1)
                 mask_for_parent_select = mask[torch.arange(expanded_batch_size), trajectory_head_idx, :]
 
-                scores.masked_fill_(~mask_for_parent_select, -1e9)
+                scores.masked_fill_(~mask_for_parent_select, -float('inf'))
                 log_prob = F.log_softmax(scores, dim=-1)
-                selected_parent_idx = Categorical(probs=log_prob.exp()).sample() if decode_type == 'sampling' else log_prob.argmax(dim=-1)
+                probs = log_prob.exp()
+                selected_parent_idx = Categorical(probs=probs).sample() if decode_type == 'sampling' else probs.argmax(dim=-1)
                 action = torch.stack([trajectory_head_idx, selected_parent_idx], dim=1)
                 log_prob_val = log_prob.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
+                selected_prob = probs.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
+
 
             if pbar:
                 child_idx = action[0, 0].item()
@@ -415,12 +425,16 @@ class PocatModel(nn.Module):
                 child_name = node_names[child_idx]
                 parent_name = node_names[parent_idx]
                 
+                # << 수정: 로그 메시지에 선택 확률을 포함하도록 변경 >>
+                prob_val = selected_prob[0].item() if selected_prob is not None else 0
                 action_description = ""
-                if phase == 0:
-                    action_description = f"Started new path with Load '{child_name}' (child: {child_idx})"
-                else:
 
-                    action_description = f"Connected '{child_name}' to '{parent_name}' (child: {child_idx}, parent: {parent_idx})"
+                if phase == 0:
+                    action_description = f"Started new path with Load '{child_name}' (Prob: {prob_val:.2%})"
+                else:
+                    parent_idx = action[0, 1].item()
+                    parent_name = node_names[parent_idx]
+                    action_description = f"Connected '{child_name}' to '{parent_name}' (Prob: {prob_val:.2%})"
                 
                 detail_msg = f"◀ Decoding ({num_connected_loads}/{num_total_loads} Loads, Step {decoding_step}): {action_description}"
                 desc = f"{base_desc} | {status_msg} | ▶ Encoding (done) | {detail_msg}"
@@ -433,6 +447,7 @@ class PocatModel(nn.Module):
             
             actions.append(action)
             log_probs.append(log_prob_val)
+
             
 
         final_reward = output_td["reward"]
