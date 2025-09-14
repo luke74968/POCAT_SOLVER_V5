@@ -182,7 +182,11 @@ class PocatPromptNet(nn.Module):
 class PocatEncoder(nn.Module):
     def __init__(self, embedding_dim: int, encoder_layer_num: int = 6, **model_params):
         super().__init__()
-        self.embedding_layer = nn.Linear(FEATURE_DIM, embedding_dim)
+        # << 수정: 단일 임베딩 레이어를 제거하고, 노드 유형별 레이어를 추가합니다.
+        # self.embedding_layer = nn.Linear(FEATURE_DIM, embedding_dim)
+        self.embedding_battery = nn.Linear(FEATURE_DIM, embedding_dim)
+        self.embedding_ic = nn.Linear(FEATURE_DIM, embedding_dim)
+        self.embedding_load = nn.Linear(FEATURE_DIM, embedding_dim)        
         
         # Sparse 파라미터를 복사하여 수정
         sparse_params = model_params.copy(); sparse_params['use_sparse'] = True
@@ -210,12 +214,34 @@ class PocatEncoder(nn.Module):
     def forward(self, td: TensorDict, prompt_embedding: torch.Tensor) -> torch.Tensor:
         node_features = td['nodes']
         batch_size, num_nodes, _ = node_features.shape
-        node_embeddings = self.embedding_layer(node_features)
+        
+        # << 수정: 노드 유형에 따라 각기 다른 임베딩 레이어를 적용합니다.
+        # 1. 노드 유형 인덱스를 추출합니다.
+        node_type_indices = node_features[:, :, FEATURE_INDEX["node_type"][0]:FEATURE_INDEX["node_type"][1]].argmax(dim=-1)
+        
+        # 2. 각 노드 유형에 대한 마스크를 생성합니다.
+        battery_mask = (node_type_indices == NODE_TYPE_BATTERY)
+        ic_mask = (node_type_indices == NODE_TYPE_IC)
+        load_mask = (node_type_indices == NODE_TYPE_LOAD)
+        
+        # 3. 최종 임베딩을 담을 텐서를 초기화합니다.
+        node_embeddings = torch.zeros(batch_size, num_nodes, self.embedding_battery.out_features, device=node_features.device)
+        
+        # 4. 마스크를 사용하여 각 노드 유형에 맞는 임베딩을 적용하고 결과를 합칩니다.
+        #    (해당하는 노드가 없는 경우에도 에러 없이 동작하도록 if-any 체크)
+        if battery_mask.any():
+            node_embeddings[battery_mask] = self.embedding_battery(node_features[battery_mask])
+        if ic_mask.any():
+            node_embeddings[ic_mask] = self.embedding_ic(node_features[ic_mask])
+        if load_mask.any():
+            node_embeddings[load_mask] = self.embedding_load(node_features[load_mask])
+        
         connectivity_mask = self._create_connectivity_mask(td)
         global_input = torch.cat((node_embeddings, prompt_embedding), dim=1)
         global_attention_mask = torch.ones(batch_size, num_nodes + 1, num_nodes + 1, dtype=torch.bool, device=node_embeddings.device)
         global_attention_mask[:, :num_nodes, :num_nodes] = connectivity_mask
         sparse_out, global_out = node_embeddings, global_input
+
 
         
         for i in range(len(self.sparse_layers)):
@@ -375,25 +401,26 @@ class PocatModel(nn.Module):
 
             else: # phase == 1
                 trajectory_head_idx = td["trajectory_head"].squeeze(-1)
-                mask_for_parent_select = mask[torch.arange(expanded_batch_size), :, trajectory_head_idx]
+                mask_for_parent_select = mask[torch.arange(expanded_batch_size), trajectory_head_idx, :]
+
                 scores.masked_fill_(~mask_for_parent_select, -1e9)
                 log_prob = F.log_softmax(scores, dim=-1)
                 selected_parent_idx = Categorical(probs=log_prob.exp()).sample() if decode_type == 'sampling' else log_prob.argmax(dim=-1)
                 action = torch.stack([trajectory_head_idx, selected_parent_idx], dim=1)
                 log_prob_val = log_prob.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
-            
 
-            
             if pbar:
                 child_idx = action[0, 0].item()
+                parent_idx = action[0, 1].item()
                 child_name = node_names[child_idx]
+                parent_name = node_names[parent_idx]
+                
                 action_description = ""
                 if phase == 0:
-                    action_description = f"Started new path with Load '{child_name}'"
+                    action_description = f"Started new path with Load '{child_name}' (child: {child_idx})"
                 else:
-                    parent_idx = action[0, 1].item()
-                    parent_name = node_names[parent_idx]
-                    action_description = f"Connected '{child_name}' to '{parent_name}'"
+
+                    action_description = f"Connected '{child_name}' to '{parent_name}' (child: {child_idx}, parent: {parent_idx})"
                 
                 detail_msg = f"◀ Decoding ({num_connected_loads}/{num_total_loads} Loads, Step {decoding_step}): {action_description}"
                 desc = f"{base_desc} | {status_msg} | ▶ Encoding (done) | {detail_msg}"
