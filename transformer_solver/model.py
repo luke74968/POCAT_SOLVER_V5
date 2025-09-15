@@ -114,7 +114,7 @@ def multi_head_attention(q, k, v, attention_mask=None, sparse_type=None):
         
         # 선택되지 않은 나머지 값들은 -inf로 마스킹
         topk_mask = torch.zeros_like(score_scaled, dtype=torch.bool).scatter_(-1, top_k_indices, True)
-        attention_weights = score_scaled.masked_fill(~topk_mask, -float('inf'))
+        attention_weights = score_scaled.masked_fill(~topk_mask, -1e9)
         weights = nn.Softmax(dim=3)(attention_weights)
     else:
         # Standard (Dense) Attention
@@ -337,7 +337,7 @@ class PocatDecoder(nn.Module):
         
         # 3. 최종 Logits 계산 (Single-Head Attention)
         scores = torch.matmul(mh_atten_out, cache.logit_key).squeeze(1) / (self.embedding_dim ** 0.5)
-        #scores = torch.tanh(scores) * self.logit_clipping
+        scores = torch.tanh(scores) * self.logit_clipping
 
         return scores
 

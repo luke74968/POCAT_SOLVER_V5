@@ -229,11 +229,8 @@ class PocatEnv(EnvBase):
             child_vin_max = td["nodes"][b_idx, child_indices, FEATURE_INDEX["vin_max"]]
             parent_vout_min = td["nodes"][b_idx, :, FEATURE_INDEX["vout_min"]]
             parent_vout_max = td["nodes"][b_idx, :, FEATURE_INDEX["vout_max"]]
-            epsilon = 1e-6
-
-            is_voltage_compatible = (parent_vout_min <= child_vin_max.unsqueeze(1) + epsilon) & \
-                                    (parent_vout_max >= child_vin_min.unsqueeze(1) - epsilon)
-
+            is_voltage_compatible = (parent_vout_min <= child_vin_max.unsqueeze(1)) & \
+                                    (parent_vout_max >= child_vin_min.unsqueeze(1))
             can_be_parent &= is_voltage_compatible
             # << 핵심 수정: 전류 한계 검사 로직 단순화 및 수정 >>
             # 4. 전류 한계 검사
