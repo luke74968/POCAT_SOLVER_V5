@@ -78,17 +78,26 @@ def reshape_by_heads(qkv: torch.Tensor, head_num: int) -> torch.Tensor:
     return q_reshaped.transpose(1, 2)
 
 # 💡 수정: multi_head_attention이 sparse_type을 인자로 받도록 변경
+
 def multi_head_attention(q, k, v, attention_mask=None, sparse_type=None):
     batch_s, head_num, n, key_dim = q.shape
     score = torch.matmul(q, k.transpose(2, 3))
     score_scaled = score / (key_dim ** 0.5)
     
+    """"""
+    # attention_mask가 제공되었는지 확인합니다.
     if attention_mask is not None:
+        # attention_mask의 차원(dimension)을 어텐션 스코어 행렬에 맞게 조정합니다.
+        # Multi-Head Attention에서는 (batch, head, query_len, key_len) 형태가 필요합니다.
         if attention_mask.dim() == 3:
+            # (batch, query_len, key_len) -> (batch, 1, query_len, key_len)
             attention_mask = attention_mask.unsqueeze(1)
         elif attention_mask.dim() == 2:
+            # (query_len, key_len) -> (batch, 1, 1, query_len, key_len)
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        score_scaled = score_scaled.masked_fill(attention_mask == 0, -float('inf'))
+        
+        # attention_mask의 값이 0인 모든 위치를 -inf로 채웁니다.
+        score_scaled = score_scaled.masked_fill(attention_mask == 0, -1e9)
 
 
         

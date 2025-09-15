@@ -262,11 +262,19 @@ class PocatEnv(EnvBase):
                 if 0 <= head_load_idx[idx] < len(loads_info):
                     load = loads_info[head_load_idx[idx]]
                     rail_type = load.get("independent_rail_type")
+                    # << 수정: 배터리(노드 0)는 이 제약에서 제외하도록 수정 >>
+                    is_not_battery_mask = torch.ones(num_nodes, dtype=torch.bool, device=self.device)
+                    is_not_battery_mask[0] = False
+                    
                     if rail_type == "exclusive_supplier":
-                        # adj_matrix.sum() 연산이 GPU에서 수행됩니다.
-                        can_be_parent[idx] &= td["adj_matrix"][b].sum(dim=1) == 0
+                        # 이미 자식이 있는 노드는 부모가 될 수 없음 (단, 배터리는 예외)
+                        no_existing_children_mask = td["adj_matrix"][b].sum(dim=1) == 0
+                        can_be_parent[idx] &= (no_existing_children_mask | ~is_not_battery_mask)
                     elif rail_type == "exclusive_path":
-                        can_be_parent[idx] &= td["adj_matrix"][b].sum(dim=1) <= 1
+                        # 이미 자식이 2개 이상 있는 노드는 부모가 될 수 없음 (단, 배터리는 예외)
+                        less_than_two_children_mask = td["adj_matrix"][b].sum(dim=1) <= 1
+                        can_be_parent[idx] &= (less_than_two_children_mask | ~is_not_battery_mask)
+
             
             for seq in constraints.get("power_sequences", []):
                 if seq.get("f") != 1: continue
@@ -284,7 +292,7 @@ class PocatEnv(EnvBase):
             mask[b_idx, child_indices, :] = can_be_parent
             
         return mask
-
+    
 
     
     def get_reward(self, td: TensorDict, timed_out: torch.Tensor) -> torch.Tensor:
