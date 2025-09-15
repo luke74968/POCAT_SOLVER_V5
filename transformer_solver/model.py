@@ -420,7 +420,7 @@ class PocatModel(nn.Module):
 
             if phase == 0:
                 mask_for_load_select = mask[:, :, 0]
-                scores.masked_fill_(~mask_for_load_select, -float('inf'))
+                scores.masked_fill_(~mask_for_load_select, -1e9)
                 log_prob = F.log_softmax(scores, dim=-1)
 
                 probs = log_prob.exp()
@@ -434,7 +434,7 @@ class PocatModel(nn.Module):
                 trajectory_head_idx = td["trajectory_head"].squeeze(-1)
                 mask_for_parent_select = mask[torch.arange(expanded_batch_size), trajectory_head_idx, :]
 
-                scores.masked_fill_(~mask_for_parent_select, -float('inf'))
+                scores.masked_fill_(~mask_for_parent_select, -1e9)
                 log_prob = F.log_softmax(scores, dim=-1)
                 probs = log_prob.exp()
                 selected_parent_idx = Categorical(probs=probs).sample() if decode_type == 'sampling' else probs.argmax(dim=-1)
