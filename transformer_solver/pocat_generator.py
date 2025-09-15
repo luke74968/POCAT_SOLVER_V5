@@ -113,14 +113,14 @@ class PocatGenerator:
         print(f"🔪 Dominance Pruning 완료: {len(candidate_ic_objs)}개 -> {len(pruned_ics_dicts)}개 최종 인스턴스")
         # --- 수정 완료 ---
         
-        """
+
         # --- 💡 [핵심 수정] 최종 인스턴스 목록 로그 출력 ---
         print("\n--- ✅ 최종 후보 IC 인스턴스 목록 ---")
         for ic_dict in sorted(pruned_ics_dicts, key=lambda x: x['name']):
             print(f"   - {ic_dict['name']}")
         print("------------------------------------")
         # --- 수정 완료 ---
-        """
+
 
 
         config_data['available_ics'] = pruned_ics_dicts # Pruning된 최종 목록 사용

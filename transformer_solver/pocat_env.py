@@ -143,6 +143,7 @@ class PocatEnv(EnvBase):
         phase1_mask = phase == 1
         phase1_mask = phase == 1
         if phase1_mask.any():
+            # << 수정: Phase 1에서만 사용되는 모든 변수와 로직을 이 블록 안으로 이동 >>
             b_phase1 = b_idx[phase1_mask]
             child_idx, parent_idx = action[b_phase1, 0], action[b_phase1, 1]
             next_obs["adj_matrix"][b_phase1, parent_idx, child_idx] = True
@@ -203,8 +204,8 @@ class PocatEnv(EnvBase):
 
         # Phase 0: 아직 연결되지 않은 Load만 선택 가능
         phase0_mask = (td["decoding_phase"].squeeze(-1) == 0)
-        if phase0_mask.any():
-            mask[phase0_mask, :, 0] = td["unconnected_loads_mask"][phase0_mask]
+        if phase0_mask.any(): 
+            mask[phase0_mask, :, 0] = td["unconnected_loads_mask"][phase0_mask] 
 
         # Phase 1: 현재 경로를 이을 부모 노드 선택
         phase1_mask = ~phase0_mask
@@ -248,10 +249,7 @@ class PocatEnv(EnvBase):
 
             # 5. 기타 제약조건 (Power Sequence, Independent Rail)
             constraints, loads_info, node_names = self.generator.config.constraints, self.generator.config.loads, self.generator.config.node_names
-            # ancestors 텐서 생성 시 device를 지정합니다.
-            ancestors = td["adj_matrix"][b_idx].clone().to(self.device) 
-            for _ in range(num_nodes): # 최악의 경우를 대비해 num_nodes 만큼 반복
-                ancestors = ancestors | (ancestors.float() @ ancestors.float()).bool()
+
             
             head_load_idx = child_indices - (1 + len(self.generator.config.available_ics))
 
@@ -259,23 +257,31 @@ class PocatEnv(EnvBase):
             # 그 안의 텐서 연산은 이미 GPU에서 수행되도록 변경되었습니다.
 
             for idx, b in enumerate(b_idx.tolist()):
+                # head_load_idx가 유효한 Load 인덱스인 경우에만 제약조건 검사
                 if 0 <= head_load_idx[idx] < len(loads_info):
                     load = loads_info[head_load_idx[idx]]
                     rail_type = load.get("independent_rail_type")
-                    # << 수정: 배터리(노드 0)는 이 제약에서 제외하도록 수정 >>
-                    is_not_battery_mask = torch.ones(num_nodes, dtype=torch.bool, device=self.device)
-                    is_not_battery_mask[0] = False
-                    
-                    if rail_type == "exclusive_supplier":
-                        # 이미 자식이 있는 노드는 부모가 될 수 없음 (단, 배터리는 예외)
-                        no_existing_children_mask = td["adj_matrix"][b].sum(dim=1) == 0
-                        can_be_parent[idx] &= (no_existing_children_mask | ~is_not_battery_mask)
-                    elif rail_type == "exclusive_path":
-                        # 이미 자식이 2개 이상 있는 노드는 부모가 될 수 없음 (단, 배터리는 예외)
-                        less_than_two_children_mask = td["adj_matrix"][b].sum(dim=1) <= 1
-                        can_be_parent[idx] &= (less_than_two_children_mask | ~is_not_battery_mask)
 
-            
+                    if rail_type:
+                        # << 핵심 버그 수정: 배터리(노드 0)는 이 제약에서 제외하도록 마스크 생성 >>
+                        is_not_battery_mask = torch.ones(num_nodes, dtype=torch.bool, device=self.device)
+                        is_not_battery_mask[0] = False
+
+                        if rail_type == "exclusive_supplier":
+                            # 이미 자식이 있는 노드는 부모가 될 수 없음 (단, 배터리는 예외)
+                            no_existing_children_mask = td["adj_matrix"][b].sum(dim=1) == 0
+                            can_be_parent[idx] &= (no_existing_children_mask | ~is_not_battery_mask)
+                        elif rail_type == "exclusive_path":
+                            # 이미 자식이 2개 이상 있는 노드는 부모가 될 수 없음 (단, 배터리는 예외)
+                            less_than_two_children_mask = td["adj_matrix"][b].sum(dim=1) <= 1
+                            can_be_parent[idx] &= (less_than_two_children_mask | ~is_not_battery_mask)
+    
+            # Power Sequence 제약조건
+            # ancestors 텐서 생성 시 device를 지정합니다.
+            ancestors = td["adj_matrix"][b_idx].clone().to(self.device) 
+            for _ in range(num_nodes): # 최악의 경우를 대비해 num_nodes 만큼 반복
+                ancestors = ancestors | (ancestors.float() @ ancestors.float()).bool()
+
             for seq in constraints.get("power_sequences", []):
                 if seq.get("f") != 1: continue
                 j_name, k_name = seq.get("j"), seq.get("k")

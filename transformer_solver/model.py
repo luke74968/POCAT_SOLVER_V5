@@ -317,6 +317,19 @@ class PocatDecoder(nn.Module):
             query_input = torch.cat([head_emb, state_features], dim=1)
             q = reshape_by_heads(self.Wq_parent_select(query_input.unsqueeze(1)), self.head_num)
         
+        # << 쿼리 출력 부분 >>
+        # 2. PyTorch의 출력 옵션을 일시적으로 변경하여 텐서가 잘리지 않게 합니다.
+        torch.set_printoptions(profile="full", linewidth=200)
+        
+        # 3. 현재 디코딩 단계(Phase)와 쿼리 텐서의 값을 출력합니다.
+        #    (배치가 크므로, 첫 번째 아이템의 쿼리 텐서만 확인합니다)
+        print(f"\n[DEBUG] Phase: {phase} | Full Query Tensor (Batch 0):")
+        print(q[0].detach().cpu())
+        
+        # 4. 출력 옵션을 원래대로 복원합니다.
+        torch.set_printoptions(profile="default")
+        # << 출력 끝 >>
+
         # 2. Multi-Head Attention 수행
         mha_out = multi_head_attention(q, cache.glimpse_key, cache.glimpse_val)
         mh_atten_out = self.multi_head_combine(mha_out)
