@@ -270,11 +270,12 @@ class PocatEncoder(nn.Module):
 
 # 💡 [CaDA 장점 적용 2] 디코더 로직 수정
 class PocatDecoder(nn.Module):
-    def __init__(self, embedding_dim, head_num, qkv_dim, **model_params):
+    def __init__(self, embedding_dim, head_num, qkv_dim, logit_clipping=10.0, **model_params):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.head_num = head_num
         self.qkv_dim = qkv_dim
+        self.logit_clipping = logit_clipping
 
         self.Wk = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
         self.Wv = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
@@ -336,7 +337,8 @@ class PocatDecoder(nn.Module):
         
         # 3. 최종 Logits 계산 (Single-Head Attention)
         scores = torch.matmul(mh_atten_out, cache.logit_key).squeeze(1) / (self.embedding_dim ** 0.5)
-        
+        #scores = torch.tanh(scores) * self.logit_clipping
+
         return scores
 
 class PocatModel(nn.Module):
