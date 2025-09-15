@@ -200,8 +200,10 @@ class PocatTrainer:
         for ic_data in expanded_ic_configs:
             ic_type = ic_data.get('type')
             if ic_type == 'LDO':
+                ic_data.pop('original_i_limit',None)
                 candidate_ics.append(LDO(**ic_data))
             elif ic_type == 'Buck':
+                ic_data.pop('original_i_limit',None)
                 candidate_ics.append(BuckConverter(**ic_data))
         # --- 수정 완료 ---
 

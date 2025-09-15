@@ -97,7 +97,7 @@ def multi_head_attention(q, k, v, attention_mask=None, sparse_type=None):
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         
         # attention_mask의 값이 0인 모든 위치를 -inf로 채웁니다.
-        score_scaled = score_scaled.masked_fill(attention_mask == 0, -1e9)
+        score_scaled = score_scaled.masked_fill(attention_mask == 0, -float('inf'))
 
 
         
@@ -293,7 +293,7 @@ class PocatDecoder(nn.Module):
 
     def forward(self, td: TensorDict, cache: PrecomputedCache):
         # 1. Phase에 따라 컨텍스트와 쿼리 생성
-        phase = td["decoding_phase"][0, 0].item()
+        phase_representative = td["decoding_phase"][0, 0].item()
         
         # 💡 [CaDA 장점 적용 3] 동적 상태(State) 기반 쿼리 생성
         # 현재 전력망의 상태 정보를 집계
@@ -303,7 +303,7 @@ class PocatDecoder(nn.Module):
         
         state_features = torch.cat([avg_current_draw, main_tree_ratio, unconnected_ratio], dim=1)
 
-        if phase == 0:
+        if phase_representative == 0:
             # Phase 0: 주 전력망의 평균 임베딩을 컨텍스트로 사용
             main_tree_nodes = cache.node_embeddings * td["main_tree_mask"].unsqueeze(-1)
             context = main_tree_nodes.sum(1) / (td["main_tree_mask"].sum(1, keepdim=True) + 1e-9)
@@ -320,15 +320,15 @@ class PocatDecoder(nn.Module):
         
         # << 쿼리 출력 부분 >>
         # 2. PyTorch의 출력 옵션을 일시적으로 변경하여 텐서가 잘리지 않게 합니다.
-        torch.set_printoptions(profile="full", linewidth=200)
+        #torch.set_printoptions(profile="full", linewidth=200)
         
         # 3. 현재 디코딩 단계(Phase)와 쿼리 텐서의 값을 출력합니다.
         #    (배치가 크므로, 첫 번째 아이템의 쿼리 텐서만 확인합니다)
-        print(f"\n[DEBUG] Phase: {phase} | Full Query Tensor (Batch 0):")
-        print(q[0].detach().cpu())
+        #print(f"\n[DEBUG] Phase: {phase} | Full Query Tensor (Batch 0):")
+        #print(q[0].detach().cpu())
         
         # 4. 출력 옵션을 원래대로 복원합니다.
-        torch.set_printoptions(profile="default")
+        #torch.set_printoptions(profile="default")
         # << 출력 끝 >>
 
         # 2. Multi-Head Attention 수행
@@ -397,51 +397,78 @@ class PocatModel(nn.Module):
         decoding_step = 0
         while not td["done"].all():
             decoding_step += 1
-            num_connected_loads = num_total_loads - td["unconnected_loads_mask"][0].sum().item()
-            phase = td["decoding_phase"][0, 0].item()
+            
+            # <<<수정>>>: 디코딩 로직을 "대기"와 "진행"으로 분리합니다.
+            # 1. 모든 탐색에 대한 액션과 로그 확률을 저장할 텐서를 초기화합니다.
+            action = torch.zeros(expanded_batch_size, 2, dtype=torch.long, device=td.device)
+            log_prob_val = torch.zeros(expanded_batch_size, device=td.device)
+            
+            # 2. 모든 Load를 연결한 "끝난" 탐색을 찾습니다.
+            finished_mask = (td["unconnected_loads_mask"].sum(dim=1) == 0)
+            
+            # 3. "끝난" 탐색에게는 명시적인 "대기" 액션 [0, 0]과 로그 확률 0을 할당합니다.
+            if finished_mask.any():
+                action[finished_mask] = torch.tensor([0, 0], device=td.device)
+                log_prob_val[finished_mask] = 0.0
 
-            state_description = ""
-            if phase == 0:
-                state_description = "Select New Load"
-            else:
-                current_node_idx = td["trajectory_head"][0].item()
-                if current_node_idx != -1:
-                    current_node_name = node_names[current_node_idx]
-                    state_description = f"Find Parent for '{current_node_name}'"
+            # 4. 아직 "진행 중인" 탐색에 대해서만 디코더를 실행합니다.
+            unfinished_mask = ~finished_mask
+            if unfinished_mask.any():
+                td_unfinished = td[unfinished_mask]
+                cache_unfinished = PrecomputedCache(
+                    cache.node_embeddings[unfinished_mask],
+                    cache.glimpse_key[unfinished_mask],
+                    cache.glimpse_val[unfinished_mask],
+                    cache.logit_key[unfinished_mask]
+                )
 
-            if pbar and log_fn:
-                log_fn(f"{base_desc} | ... | Decoding (Step {decoding_step} State): {state_description}")
+                scores = self.decoder(td_unfinished, cache_unfinished)
+                mask = env.get_action_mask(td_unfinished)
+                
+                # 각 탐색의 phase를 개별적으로 확인합니다.
+                phase_unfinished = td_unfinished["decoding_phase"].squeeze(-1)
+                
+                # 4a. Phase 0: 새 Load 선택
+                p0_in_unfinished_mask = (phase_unfinished == 0)
+                if p0_in_unfinished_mask.any():
+                    # Phase 0에 해당하는 데이터만 추출
+                    scores_p0 = scores[p0_in_unfinished_mask]
+                    mask_p0 = mask[p0_in_unfinished_mask][:, :, 0]
+                    
+                    scores_p0.masked_fill_(~mask_p0, -1e9)
+                    log_prob_p0 = F.log_softmax(scores_p0, dim=-1)
+                    probs_p0 = log_prob_p0.exp()
+                    
+                    selected_load = Categorical(probs=probs_p0).sample() if decode_type == 'sampling' else probs_p0.argmax(dim=-1)
+                    action_p0 = torch.stack([selected_load, torch.zeros_like(selected_load)], dim=1)
+                    log_prob_val_p0 = log_prob_p0.gather(1, selected_load.unsqueeze(-1)).squeeze(-1)
 
-            scores = self.decoder(td, cache)
-            mask = env.get_action_mask(td)
+                    # 전체 action 및 log_prob_val 텐서의 해당 위치에 결과를 저장
+                    original_indices = unfinished_mask.nonzero(as_tuple=True)[0][p0_in_unfinished_mask]
+                    action[original_indices] = action_p0
+                    log_prob_val[original_indices] = log_prob_val_p0
 
-            # << 수정: selected_prob 변수를 루프 시작 전에 선언 >>
-            selected_prob = None
+                # 4b. Phase 1: 부모 노드 선택
+                p1_in_unfinished_mask = (phase_unfinished == 1)
+                if p1_in_unfinished_mask.any():
+                    td_p1 = td_unfinished[p1_in_unfinished_mask]
+                    scores_p1 = scores[p1_in_unfinished_mask]
+                    mask_p1 = mask[p1_in_unfinished_mask]
+                    
+                    head_idx_p1 = td_p1["trajectory_head"].squeeze(-1)
+                    mask_p1_final = mask_p1[torch.arange(td_p1.batch_size[0]), head_idx_p1, :]
+                    
+                    scores_p1.masked_fill_(~mask_p1_final, -1e9)
+                    log_prob_p1 = F.log_softmax(scores_p1, dim=-1)
+                    probs_p1 = log_prob_p1.exp()
 
-            if phase == 0:
-                mask_for_load_select = mask[:, :, 0]
-                scores.masked_fill_(~mask_for_load_select, -1e9)
-                log_prob = F.log_softmax(scores, dim=-1)
+                    selected_parent = Categorical(probs=probs_p1).sample() if decode_type == 'sampling' else probs_p1.argmax(dim=-1)
+                    action_p1 = torch.stack([head_idx_p1, selected_parent], dim=1)
+                    log_prob_val_p1 = log_prob_p1.gather(1, selected_parent.unsqueeze(-1)).squeeze(-1)
 
-                probs = log_prob.exp()
-                selected_load = Categorical(probs=probs).sample() if decode_type == 'sampling' else probs.argmax(dim=-1)
-                action = torch.stack([selected_load, torch.zeros_like(selected_load)], dim=1)
-                log_prob_val = log_prob.gather(1, selected_load.unsqueeze(-1)).squeeze(-1)
-                selected_prob = probs.gather(1, selected_load.unsqueeze(-1)).squeeze(-1)
-
-
-            else: # phase == 1
-                trajectory_head_idx = td["trajectory_head"].squeeze(-1)
-                mask_for_parent_select = mask[torch.arange(expanded_batch_size), trajectory_head_idx, :]
-
-                scores.masked_fill_(~mask_for_parent_select, -1e9)
-                log_prob = F.log_softmax(scores, dim=-1)
-                probs = log_prob.exp()
-                selected_parent_idx = Categorical(probs=probs).sample() if decode_type == 'sampling' else probs.argmax(dim=-1)
-                action = torch.stack([trajectory_head_idx, selected_parent_idx], dim=1)
-                log_prob_val = log_prob.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
-                selected_prob = probs.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
-
+                    original_indices = unfinished_mask.nonzero(as_tuple=True)[0][p1_in_unfinished_mask]
+                    action[original_indices] = action_p1
+                    log_prob_val[original_indices] = log_prob_val_p1
 
             if pbar:
                 child_idx = action[0, 0].item()
