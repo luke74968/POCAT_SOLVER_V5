@@ -1,17 +1,15 @@
-
 # transformer_solver/model.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from typing import Tuple
 from tensordict import TensorDict
 from dataclasses import dataclass
 
 from common.pocat_defs import FEATURE_DIM, FEATURE_INDEX, NODE_TYPE_BATTERY, NODE_TYPE_IC, NODE_TYPE_LOAD
 from common.utils.common import batchify
-from .pocat_env import PocatEnv
-
+from .pocat_env import PocatEnv, BATTERY_NODE_IDX
 
 # 💡 [CaDA 장점 적용 1] PrecomputedCache 클래스 추가
 @dataclass
@@ -206,62 +204,27 @@ class PocatEncoder(nn.Module):
         self.sparse_fusion = nn.ModuleList([nn.Linear(embedding_dim, embedding_dim) for _ in range(encoder_layer_num)])
         self.global_fusion = nn.ModuleList([nn.Linear(embedding_dim, embedding_dim) for _ in range(encoder_layer_num - 1)])
 
-    def _create_connectivity_mask(self, td: TensorDict) -> torch.Tensor:
-        nodes = td['nodes']
-        batch_size, num_nodes, _ = nodes.shape
-        node_types = nodes[0, :, :FEATURE_INDEX["node_type"][1]].argmax(-1)
-        is_parent = (node_types == NODE_TYPE_IC) | (node_types == NODE_TYPE_BATTERY)
-        is_child = (node_types == NODE_TYPE_IC) | (node_types == NODE_TYPE_LOAD)
-        parent_mask = is_parent.unsqueeze(0).unsqueeze(2).expand(batch_size, num_nodes, num_nodes)
-        child_mask = is_child.unsqueeze(0).unsqueeze(1).expand(batch_size, num_nodes, num_nodes)
-        parent_vout_min, parent_vout_max = nodes[:, :, FEATURE_INDEX["vout_min"]].unsqueeze(2), nodes[:, :, FEATURE_INDEX["vout_max"]].unsqueeze(2)
-        child_vin_min, child_vin_max = nodes[:, :, FEATURE_INDEX["vin_min"]].unsqueeze(1), nodes[:, :, FEATURE_INDEX["vin_max"]].unsqueeze(1)
-        voltage_compatible = (parent_vout_min <= child_vin_max) & (parent_vout_max >= child_vin_min)
-        mask = parent_mask & child_mask & voltage_compatible
-        mask.diagonal(dim1=-2, dim2=-1).fill_(False)
-        return mask
-
     def forward(self, td: TensorDict, prompt_embedding: torch.Tensor) -> torch.Tensor:
         node_features = td['nodes']
-        batch_size, num_nodes, _ = node_features.shape
-
-        # << 수정: 노드 유형에 따라 각기 다른 임베딩 레이어를 적용합니다.
-        # 1. 노드 유형 인덱스를 추출합니다.
-        node_type_indices = node_features[:, :, FEATURE_INDEX["node_type"][0]:FEATURE_INDEX["node_type"][1]].argmax(dim=-1)
+        batch_size, num_nodes, embedding_dim = node_features.shape[0], node_features.shape[1], self.embedding_battery.out_features
+        node_embeddings = torch.zeros(batch_size, num_nodes, embedding_dim, device=node_features.device)
         
-        # 2. 각 노드 유형에 대한 마스크를 생성합니다.
-        battery_mask = (node_type_indices == NODE_TYPE_BATTERY)
-        ic_mask = (node_type_indices == NODE_TYPE_IC)
-        load_mask = (node_type_indices == NODE_TYPE_LOAD)
+        node_type_indices = node_features[..., FEATURE_INDEX["node_type"][0]:FEATURE_INDEX["node_type"][1]].argmax(dim=-1)
+        battery_mask, ic_mask, load_mask = (node_type_indices == NODE_TYPE_BATTERY), (node_type_indices == NODE_TYPE_IC), (node_type_indices == NODE_TYPE_LOAD)
         
-        # 3. 최종 임베딩을 담을 텐서를 초기화합니다.
-        node_embeddings = torch.zeros(batch_size, num_nodes, self.embedding_battery.out_features, device=node_features.device)
+        if battery_mask.any(): node_embeddings[battery_mask] = self.embedding_battery(node_features[battery_mask])
+        if ic_mask.any(): node_embeddings[ic_mask] = self.embedding_ic(node_features[ic_mask])
+        if load_mask.any(): node_embeddings[load_mask] = self.embedding_load(node_features[load_mask])
         
-        # 4. 마스크를 사용하여 각 노드 유형에 맞는 임베딩을 적용하고 결과를 합칩니다.
-        #    (해당하는 노드가 없는 경우에도 에러 없이 동작하도록 if-any 체크)
-        if battery_mask.any():
-            node_embeddings[battery_mask] = self.embedding_battery(node_features[battery_mask])
-        if ic_mask.any():
-            node_embeddings[ic_mask] = self.embedding_ic(node_features[ic_mask])
-        if load_mask.any():
-            node_embeddings[load_mask] = self.embedding_load(node_features[load_mask])
-        
-        connectivity_mask = self._create_connectivity_mask(td)
+        connectivity_mask = td['connectivity_matrix']
         global_input = torch.cat((node_embeddings, prompt_embedding), dim=1)
         global_attention_mask = torch.ones(batch_size, num_nodes + 1, num_nodes + 1, dtype=torch.bool, device=node_embeddings.device)
         global_attention_mask[:, :num_nodes, :num_nodes] = connectivity_mask
-        sparse_out, global_out = node_embeddings, global_input
-
-
         
+        sparse_out, global_out = node_embeddings, global_input
         for i in range(len(self.sparse_layers)):
-            # 💡 [핵심 수정] Sparse Stream에 'connectivity_mask'를 전달합니다.
             sparse_out = self.sparse_layers[i](sparse_out, attention_mask=connectivity_mask)
-            
-            # Global Stream: 연결성 마스크 기반 어텐션
             global_out = self.global_layers[i](global_out, attention_mask=global_attention_mask)
-            
-            # Fusion
             sparse_out = sparse_out + self.sparse_fusion[i](global_out[:, :num_nodes])
             if i < len(self.global_layers) - 1:
                 global_nodes = global_out[:, :num_nodes] + self.global_fusion[i](sparse_out)
@@ -274,57 +237,30 @@ class PocatDecoder(nn.Module):
     def __init__(self, embedding_dim, head_num, qkv_dim, **model_params):
         super().__init__()
         self.embedding_dim = embedding_dim
-        self.head_num = head_num
-        self.qkv_dim = qkv_dim
-
-        self.Wk = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
-        self.Wv = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
-        self.Wk_logit = nn.Linear(embedding_dim, embedding_dim, bias=False)
-
+        self.head_num, self.qkv_dim = head_num, qkv_dim
+        self.Wk, self.Wv, self.Wk_logit = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False), nn.Linear(embedding_dim, head_num * qkv_dim, bias=False), nn.Linear(embedding_dim, embedding_dim, bias=False)
         
-        # 쿼리 생성용 Linear 레이어: 상태 정보를 추가로 입력받음
-        # 상태 벡터 차원: 1 (ic_current_draw) + 1 (main_tree_mask) + 1 (unconnected_loads_mask) = 3
-        # Phase 0: main_tree context + 전역 상태
-        self.Wq_load_select = nn.Linear(embedding_dim + 3, head_num * qkv_dim, bias=False)
-        # Phase 1: trajectory head + 전역 상태
-        self.Wq_parent_select = nn.Linear(embedding_dim + 3, head_num * qkv_dim, bias=False)
-        
+        # 상태 벡터 차원: 3 (avg_current, unconnected_ratio, step_ratio)
+        self.Wq_context = nn.Linear(embedding_dim + 3, head_num * qkv_dim, bias=False)
         self.multi_head_combine = nn.Linear(head_num * qkv_dim, embedding_dim)
 
     def forward(self, td: TensorDict, cache: PrecomputedCache):
-        # 1. Phase에 따라 컨텍스트와 쿼리 생성
-        phase = td["decoding_phase"][0, 0].item()
-        
-        # 💡 [CaDA 장점 적용 3] 동적 상태(State) 기반 쿼리 생성
-        # 현재 전력망의 상태 정보를 집계
-        avg_current_draw = td["ic_current_draw"].mean(dim=1, keepdim=True)
-        main_tree_ratio = td["main_tree_mask"].float().mean(dim=1, keepdim=True)
+        # 동적 상태 피처 생성
+        avg_current = td["nodes"][:, :, FEATURE_INDEX["current_out"]].mean(dim=1, keepdim=True)
         unconnected_ratio = td["unconnected_loads_mask"].float().mean(dim=1, keepdim=True)
-        
-        state_features = torch.cat([avg_current_draw, main_tree_ratio, unconnected_ratio], dim=1)
+        step_ratio = td["step_count"].float() / (2 * td.shape[1])
+        state_features = torch.cat([avg_current, unconnected_ratio, step_ratio], dim=1)
 
-        if phase == 0:
-            # Phase 0: 주 전력망의 평균 임베딩을 컨텍스트로 사용
-            main_tree_nodes = cache.node_embeddings * td["main_tree_mask"].unsqueeze(-1)
-            context = main_tree_nodes.sum(1) / (td["main_tree_mask"].sum(1, keepdim=True) + 1e-9)
-            # 컨텍스트와 상태 정보를 결합하여 쿼리 생성
-            query_input = torch.cat([context, state_features], dim=1)
-            q = reshape_by_heads(self.Wq_load_select(query_input.unsqueeze(1)), self.head_num)
-        else: # phase == 1
-            # Phase 1: 현재 경로의 끝(Head) 노드 임베딩을 컨텍스트로 사용
-            trajectory_head_idx = td["trajectory_head"].squeeze(-1)
-            head_emb = cache.node_embeddings[torch.arange(td.batch_size[0]), trajectory_head_idx]
-            # 컨텍스트와 상태 정보를 결합하여 쿼리 생성
-            query_input = torch.cat([head_emb, state_features], dim=1)
-            q = reshape_by_heads(self.Wq_parent_select(query_input.unsqueeze(1)), self.head_num)
+        # Trajectory Head의 임베딩을 컨텍스트로 사용
+        head_idx = td["trajectory_head"].squeeze(-1)
+        head_emb = cache.node_embeddings[torch.arange(td.batch_size[0]), head_idx]
         
-        # 2. Multi-Head Attention 수행
+        query_input = torch.cat([head_emb, state_features], dim=1)
+        q = reshape_by_heads(self.Wq_context(query_input.unsqueeze(1)), self.head_num)
+        
         mha_out = multi_head_attention(q, cache.glimpse_key, cache.glimpse_val)
         mh_atten_out = self.multi_head_combine(mha_out)
-        
-        # 3. 최종 Logits 계산 (Single-Head Attention)
         scores = torch.matmul(mh_atten_out, cache.logit_key).squeeze(1) / (self.embedding_dim ** 0.5)
-        
         return scores
 
 class PocatModel(nn.Module):
@@ -365,105 +301,36 @@ class PocatModel(nn.Module):
         td = batchify(td, num_starts)
         # 캐시도 POMO에 맞게 확장
         cache = cache.batchify(num_starts)
-        
-        expanded_batch_size = td.batch_size[0]
-        log_probs, actions = [], []
-        
-        # 3. 첫 번째 액션(Load 선택) 및 환경 초기화
-        action_part1 = start_nodes_idx.repeat(batch_size)
-        action_part2 = torch.zeros_like(action_part1)
-        action = torch.stack([action_part1, action_part2], dim=1)
+
+        # POMO 시작: 첫 액션을 각기 다른 Load로 설정
+        action = start_nodes_idx.repeat(batch_size).unsqueeze(-1)
+
         
         td.set("action", action)
         output_td = env.step(td)
         td = output_td["next"]
-        actions.append(action)
-        log_probs.append(torch.zeros(expanded_batch_size, device=td.device))
-        
-        decoding_step = 0
+
+        log_probs, actions = [torch.zeros(td.batch_size[0], device=td.device)], [action]
+
         while not td["done"].all():
-            decoding_step += 1
-            num_connected_loads = num_total_loads - td["unconnected_loads_mask"][0].sum().item()
-            phase = td["decoding_phase"][0, 0].item()
-
-            state_description = ""
-            if phase == 0:
-                state_description = "Select New Load"
-            else:
-                current_node_idx = td["trajectory_head"][0].item()
-                if current_node_idx != -1:
-                    current_node_name = node_names[current_node_idx]
-                    state_description = f"Find Parent for '{current_node_name}'"
-
-            if pbar and log_fn:
-                log_fn(f"{base_desc} | ... | Decoding (Step {decoding_step} State): {state_description}")
-
             scores = self.decoder(td, cache)
-            mask = env.get_action_mask(td)
-
-            # << 수정: selected_prob 변수를 루프 시작 전에 선언 >>
-            selected_prob = None
-
-            if phase == 0:
-                mask_for_load_select = mask[:, :, 0]
-                scores.masked_fill_(~mask_for_load_select, -1e12)
-                log_prob = F.log_softmax(scores, dim=-1)
-
-                probs = log_prob.exp()
-                selected_load = Categorical(probs=probs).sample() if decode_type == 'sampling' else probs.argmax(dim=-1)
-                action = torch.stack([selected_load, torch.zeros_like(selected_load)], dim=1)
-                log_prob_val = log_prob.gather(1, selected_load.unsqueeze(-1)).squeeze(-1)
-                selected_prob = probs.gather(1, selected_load.unsqueeze(-1)).squeeze(-1)
-
-
-            else: # phase == 1
-                trajectory_head_idx = td["trajectory_head"].squeeze(-1)
-                mask_for_parent_select = mask[torch.arange(expanded_batch_size), trajectory_head_idx, :]
-
-                scores.masked_fill_(~mask_for_parent_select, -1e12)
-                log_prob = F.log_softmax(scores, dim=-1)
-                probs = log_prob.exp()
-                selected_parent_idx = Categorical(probs=probs).sample() if decode_type == 'sampling' else probs.argmax(dim=-1)
-                action = torch.stack([trajectory_head_idx, selected_parent_idx], dim=1)
-                log_prob_val = log_prob.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
-                selected_prob = probs.gather(1, selected_parent_idx.unsqueeze(-1)).squeeze(-1)
-
-
-            if pbar:
-                child_idx = action[0, 0].item()
-                parent_idx = action[0, 1].item()
-                child_name = node_names[child_idx]
-                parent_name = node_names[parent_idx]
-                
-                # << 수정: 로그 메시지에 선택 확률을 포함하도록 변경 >>
-                prob_val = selected_prob[0].item() if selected_prob is not None else 0
-                action_description = ""
-
-                if phase == 0:
-                    action_description = f"Started new path with Load '{child_name}' (Prob: {prob_val:.2%})"
-                else:
-                    parent_idx = action[0, 1].item()
-                    parent_name = node_names[parent_idx]
-                    action_description = f"Connected '{child_name}' to '{parent_name}' (Prob: {prob_val:.2%})"
-                
-                detail_msg = f"◀ Decoding ({num_connected_loads}/{num_total_loads} Loads, Step {decoding_step}): {action_description}"
-                desc = f"{base_desc} | {status_msg} | ▶ Encoding (done) | {detail_msg}"
-                pbar.set_description(desc)
-                if log_fn: log_fn(desc)
-
-            td.set("action", action)
+            mask = env.get_action_mask(td).squeeze(1)
+            scores.masked_fill_(~mask, -float('inf'))
+            
+            log_prob = F.log_softmax(scores, dim=-1)
+            probs = log_prob.exp()
+            
+            action = probs.argmax(dim=-1) if decode_type == 'greedy' else Categorical(probs=probs).sample()
+            
+            td.set("action", action.unsqueeze(-1))
             output_td = env.step(td)
             td = output_td["next"]
             
-            actions.append(action)
-            log_probs.append(log_prob_val)
-
-            
-
-        final_reward = output_td["reward"]
+            actions.append(action.unsqueeze(-1))
+            log_probs.append(log_prob.gather(1, action.unsqueeze(-1)).squeeze(-1))
 
         return {
-            "reward": final_reward,
-            "log_likelihood": torch.stack(log_probs, 1).sum(1) if log_probs else torch.zeros(expanded_batch_size, device=td.device),
-            "actions": torch.stack(actions, 1) if actions else torch.empty(expanded_batch_size, 0, 2, dtype=torch.long, device=td.device)
+            "reward": output_td["reward"],
+            "log_likelihood": torch.stack(log_probs, 1).sum(1),
+            "actions": torch.stack(actions, 1)
         }

@@ -7,11 +7,9 @@ NODE_TYPE_BATTERY = 0
 NODE_TYPE_IC = 1
 NODE_TYPE_LOAD = 2
 
-# 각 노드의 피처 벡터에서 각 속성의 인덱스
-# [0:3]=NodeType, [3]=Cost, [4]=V_in_min, [5]=V_in_max, [6]=V_out_min, [7]=V_out_max,
-# [8]=I_limit, [9]=I_active, [10]=I_sleep
+# 노드 피처 텐서의 각 인덱스가 어떤 값을 의미하는지 정의
 FEATURE_INDEX = {
-    "node_type": (0, 3),
+    "node_type": (0, 3),        # One-hot: Battery, IC, Load
     "cost": 3,
     "vin_min": 4,
     "vin_max": 5,
@@ -20,9 +18,17 @@ FEATURE_INDEX = {
     "i_limit": 8,
     "current_active": 9,
     "current_sleep": 10,
+    "current_out": 11,          # (신규) IC의 현재 총 출력 전류 (동적)
+    "ic_type_idx": 12,          # (신규) 0: N/A, 1: LDO, 2: Buck (정적)
+    "op_current": 13,           # (신규) LDO의 동작 전류 (정적)
+    "efficiency_params": (14, 17), # (신규) Buck 손실 계산 계수 a,b,c (정적)
+    "theta_ja": 17,             # (신규) 열저항 (정적)
+    "t_junction_max": 18,       # (신규) 최대 허용 정션 온도 (정적)
+    "junction_temp": 19,        # (신규) 현재 정션 온도 (동적)
 }
-FEATURE_DIM = 11
 
+# 전체 피처 차원
+FEATURE_DIM = 20
 # 💡 수정: 기존 PROMPT_FEATURE_DIM을 SCALAR_PROMPT_FEATURE_DIM으로 변경
 SCALAR_PROMPT_FEATURE_DIM = 4
 

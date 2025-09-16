@@ -121,17 +121,20 @@ class PocatGenerator:
         print("------------------------------------")
         # --- 수정 완료 ---
         """
-
-
         config_data['available_ics'] = pruned_ics_dicts # Pruning된 최종 목록 사용
         self.config = PocatConfig(**config_data)
         
         self.num_nodes = len(self.config.node_names)
         self.num_loads = len(self.config.loads)
+        self.num_ics = len(self.config.available_ics)
 
 
     def _create_feature_tensor(self) -> torch.Tensor:
         features = torch.zeros(self.num_nodes, FEATURE_DIM)
+        ambient_temp = self.config.constraints.get("ambient_temperature", 25.0)
+
+        # 모든 노드의 초기 온도는 주변 온도로 설정
+        features[:, FEATURE_INDEX["junction_temp"]] = ambient_temp
         
         battery_conf = self.config.battery
         features[0, FEATURE_INDEX["node_type"][0] + NODE_TYPE_BATTERY] = 1.0
@@ -153,6 +156,18 @@ class PocatGenerator:
             
             # 열 마진이 적용된 i_limit
             features[idx, FEATURE_INDEX["i_limit"]] = ic_conf.get("i_limit", 0.0)
+            features[idx, FEATURE_INDEX["theta_ja"]] = ic_conf.get("theta_ja", 999.0)
+            features[idx, FEATURE_INDEX["t_junction_max"]] = ic_conf.get("t_junction_max", 125.0)
+
+            ic_type = ic_conf.get("type")
+            if ic_type == 'LDO':
+                features[idx, FEATURE_INDEX["ic_type_idx"]] = 1.0
+                features[idx, FEATURE_INDEX["op_current"]] = ic_conf.get("operating_current", 0.0)
+            elif ic_type == 'Buck':
+                features[idx, FEATURE_INDEX["ic_type_idx"]] = 2.0
+                eff_params = ic_conf.get("efficiency_params", [0.0, 0.0, 0.0])
+                s, e = FEATURE_INDEX["efficiency_params"]
+                features[idx, s:e] = torch.tensor(eff_params)
 
         start_idx += len(self.config.available_ics)
         for i, load_conf in enumerate(self.config.loads):
@@ -165,10 +180,38 @@ class PocatGenerator:
 
         return features
 
+    def _create_connectivity_matrix(self, node_features: torch.Tensor) -> torch.Tensor:
+        """
+        노드 피처를 기반으로 물리적으로 연결 가능한 엣지를 나타내는 인접 행렬을 생성합니다.
+        (전압 호환성 기반)
+        """
+        num_nodes = node_features.shape[0]
+        node_types = node_features[:, FEATURE_INDEX["node_type"][0]:FEATURE_INDEX["node_type"][1]].argmax(-1)
+        
+        is_parent = (node_types == NODE_TYPE_IC) | (node_types == NODE_TYPE_BATTERY)
+        is_child = (node_types == NODE_TYPE_IC) | (node_types == NODE_TYPE_LOAD)
+        
+        parent_mask = is_parent.unsqueeze(1).expand(-1, num_nodes)
+        child_mask = is_child.unsqueeze(0).expand(num_nodes, -1)
+        
+        parent_vout_min = node_features[:, FEATURE_INDEX["vout_min"]].unsqueeze(1)
+        parent_vout_max = node_features[:, FEATURE_INDEX["vout_max"]].unsqueeze(1)
+        child_vin_min = node_features[:, FEATURE_INDEX["vin_min"]].unsqueeze(0)
+        child_vin_max = node_features[:, FEATURE_INDEX["vin_max"]].unsqueeze(0)
+        
+        voltage_compatible = (parent_vout_min <= child_vin_max) & (parent_vout_max >= child_vin_min)
+        
+        # adj_matrix[i, j] = 1  =>  i가 j의 부모가 될 수 있음 (i -> j)
+        adj_matrix = parent_mask & child_mask & voltage_compatible
+        adj_matrix.diagonal().fill_(False)
+        return adj_matrix.to(torch.bool)
+
+
     def __call__(self, batch_size: int, **kwargs) -> TensorDict:
         node_features = self._create_feature_tensor()
+        connectivity_matrix = self._create_connectivity_matrix(node_features)
+
         constraints = self.config.constraints
-        
         # --- 👇 [핵심] 프롬프트 피처를 스칼라와 행렬로 분리하여 생성 ---
         # 1. 스칼라 피처 생성 (4차원)
         scalar_prompt_list = [
@@ -185,10 +228,9 @@ class PocatGenerator:
         
         for seq in constraints.get("power_sequences", []):
             if seq.get("f") == 1:
-                j_name, k_name = seq['j'], seq['k']
-                if j_name in node_name_to_idx and k_name in node_name_to_idx:
-                    j_idx = node_name_to_idx[j_name]
-                    k_idx = node_name_to_idx[k_name]
+                j_idx = node_name_to_idx.get(seq['j'])
+                k_idx = node_name_to_idx.get(seq['k'])
+                if j_idx is not None and k_idx is not None:
                     matrix_prompt_features[j_idx, k_idx] = 1.0
         
         # --- 수정 완료 ---
@@ -197,12 +239,12 @@ class PocatGenerator:
         node_features = node_features.unsqueeze(0).expand(batch_size, -1, -1)
         scalar_prompt_features = scalar_prompt_features.unsqueeze(0).expand(batch_size, -1)
         matrix_prompt_features = matrix_prompt_features.unsqueeze(0).expand(batch_size, -1, -1)
+        connectivity_matrix = connectivity_matrix.unsqueeze(0).expand(batch_size, -1, -1)
+
         
-        return TensorDict(
-            {
-                "nodes": node_features, 
-                "scalar_prompt_features": scalar_prompt_features,
-                "matrix_prompt_features": matrix_prompt_features
-            },
-            batch_size=[batch_size],
-        )
+        return TensorDict({
+            "nodes": node_features, 
+            "scalar_prompt_features": scalar_prompt_features,
+            "matrix_prompt_features": matrix_prompt_features,
+            "connectivity_matrix": connectivity_matrix
+        }, batch_size=[batch_size])
