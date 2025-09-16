@@ -333,7 +333,7 @@ class PocatModel(nn.Module):
             # --- 로그 추가 완료 ---
             
             scores = self.decoder(td, cache)
-            mask = env.get_action_mask(td).squeeze(1)
+            mask = env.get_action_mask(td)
             # --- 👇 [핵심 추가] 마스크 상태 로깅 ---
             if log_fn:
                 # 첫 번째 샘플의 마스크에서 유효한 행동(True)의 개수 로깅

@@ -181,11 +181,30 @@ class PocatEnv(EnvBase):
                     theta_ja = node_feat[FEATURE_INDEX["theta_ja"]].item()
                     next_obs["nodes"][i, n_idx, FEATURE_INDEX["junction_temp"]] = ambient_temp + power_loss * theta_ja
         
-        next_obs.set("step_count", td["step_count"] + 1)
+        # --- 👇 [핵심 수정] "갇힌 상태" 또는 "완성 상태"를 미리 감지하여 종료 ---
+        # 1. 다음 상태에서 가능한 행동 마스크를 미리 계산
+        next_mask = self.get_action_mask(next_obs)
+        # 2. 유효한 행동이 하나도 없는지 확인 (갇혔거나, 모든 Load를 연결하고 Battery로 돌아온 완성 상태)
+        is_stuck_or_finished = ~next_mask.any(dim=-1)
+
+        # 3. 기존 종료 조건들과 결합
         all_loads_connected = (next_obs["unconnected_loads_mask"].sum(dim=1) == 0)
-        is_done = all_loads_connected & (next_obs["trajectory_head"].squeeze(-1) == BATTERY_NODE_IDX)
+        trajectory_finished = (next_obs["trajectory_head"].squeeze(-1) == BATTERY_NODE_IDX)
+        done_successfully = all_loads_connected & trajectory_finished
         
-        return TensorDict({"next": next_obs, "reward": self.get_reward(next_obs, is_done), "done": is_done.unsqueeze(-1)}, batch_size=td.batch_size)
+        max_steps = 2 * self.generator.num_nodes
+        timed_out = (next_obs["step_count"] > max_steps).squeeze(-1)
+        
+        # 성공적으로 끝났거나, 타임아웃이거나, 중간에 갇혔을 때 종료
+        is_done = done_successfully | timed_out | is_stuck_or_finished
+        next_obs["done"] = is_done.unsqueeze(-1)
+        # --- 수정 완료 ---
+        
+        return TensorDict({
+            "next": next_obs,
+            "reward": self.get_reward(next_obs, done_successfully, timed_out, is_stuck_or_finished),
+            "done": next_obs["done"],
+        }, batch_size=td.batch_size)
 
         
     # 💡 *** 여기가 핵심 수정 부분입니다 ***
@@ -283,30 +302,26 @@ class PocatEnv(EnvBase):
     
 
     
-    def get_reward(self, td: TensorDict, timed_out: torch.Tensor) -> torch.Tensor:
+    def get_reward(self, td: TensorDict, done_successfully: torch.Tensor, timed_out: torch.Tensor, is_stuck_or_finished: torch.Tensor) -> torch.Tensor:
         """
-        Calculates the reward based on the final state of the power tree.
-        The reward is the negative of the total cost of used ICs.
-        This function is called only when an episode is done.
+        보상을 계산합니다. 성공, 타임아웃, 갇힘 상태에 따라 다른 보상을 부여합니다.
         """
-        reward = torch.zeros(td.batch_size[0], device=self.device)
-        done = td["done"].squeeze(-1)
+        batch_size = td.batch_size[0]
+        reward = torch.zeros(batch_size, device=self.device)
         
-        # 성공적으로 완료된 경우
-        done_success = done & ~timed_out
-        if done_success.any():
-            is_used_mask = td["adj_matrix"][done_success].any(dim=1) | td["adj_matrix"][done_success].any(dim=2)
-            node_costs = td["nodes"][done_success, :, FEATURE_INDEX["cost"]]
-            ic_mask = td["nodes"][done_success, :, FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1
+        # 성공적으로 완료된 경우: 사용된 IC 비용의 음수값
+        if done_successfully.any():
+            is_used_mask = td["adj_matrix"][done_successfully].any(dim=2)
+            node_costs = td["nodes"][done_successfully, :, FEATURE_INDEX["cost"]]
+            ic_mask = td["nodes"][done_successfully, :, FEATURE_INDEX["node_type"][0] + NODE_TYPE_IC] == 1
             used_ic_mask = is_used_mask & ic_mask
             total_cost = (node_costs * used_ic_mask).sum(dim=-1)
-            reward[done_success] = -total_cost
+            reward[done_successfully] = -total_cost
 
-        # 💡 *** 여기가 핵심 수정 부분입니다 (2/2) ***
-        # 시간 초과로 실패한 경우 패널티를 부여합니다.
-        if timed_out.any():
-            # 연결하지 못한 Load의 수만큼 큰 패널티를 부여합니다.
-            unconnected_loads = td["unconnected_loads_mask"][timed_out].sum(dim=1).float()
-            reward[timed_out] -= unconnected_loads * 10.0 # 패널티 값
+        # 중간에 갇히거나 타임아웃으로 실패한 경우: 큰 패널티
+        # (성공적으로 끝난 경우는 제외하고 패널티 부여)
+        failed = (timed_out | is_stuck_or_finished) & ~done_successfully
+        if failed.any():
+            reward[failed] -= 100.0 # 예시 패널티 값
             
         return reward
