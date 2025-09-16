@@ -128,10 +128,18 @@ class PocatEnv(EnvBase):
 
 
     def _step(self, td: TensorDict) -> TensorDict:
+        new_batch_size = td.batch_size[0]
+        if new_batch_size > len(self.trajectory_head_stacks):
+            num_repeats = new_batch_size // len(self.trajectory_head_stacks)
+            self.trajectory_head_stacks = [
+                stack.copy() for stack in self.trajectory_head_stacks for _ in range(num_repeats)
+            ]
+
         action = td["action"].squeeze(-1)
         current_head = td["trajectory_head"].squeeze(-1)
         next_obs = td.clone()
-        batch_size, num_nodes = td.shape
+        batch_size = td.batch_size[0]
+        num_nodes = td["nodes"].shape[1]
         
         for i in range(batch_size):
             head, act = current_head[i].item(), action[i].item()
@@ -221,7 +229,8 @@ class PocatEnv(EnvBase):
             # 4. 전류 한계 검사
             current_path_mask = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"])
             path_nodes_currents = (td["nodes"][b_idx, :, FEATURE_INDEX["current_active"]] * current_path_mask).sum(dim=1)
-            prospective_draw = td["ic_current_draw"][b_idx] + path_nodes_currents.unsqueeze(1)
+            current_draw = td["nodes"][b_idx, :, FEATURE_INDEX["current_out"]]
+            prospective_draw = current_draw + path_nodes_currents.unsqueeze(1)
             parent_limits = td["nodes"][b_idx, :, FEATURE_INDEX["i_limit"]]
             can_be_parent &= (prospective_draw <= parent_limits) | (parent_limits == 0)
 
@@ -268,7 +277,7 @@ class PocatEnv(EnvBase):
             can_be_parent &= ~is_load.unsqueeze(0)
 
 
-            mask[b_idx, child_indices, :] = can_be_parent
+            mask[b_idx] = can_be_parent
             
         return mask
     

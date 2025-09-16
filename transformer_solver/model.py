@@ -248,7 +248,9 @@ class PocatDecoder(nn.Module):
         # 동적 상태 피처 생성
         avg_current = td["nodes"][:, :, FEATURE_INDEX["current_out"]].mean(dim=1, keepdim=True)
         unconnected_ratio = td["unconnected_loads_mask"].float().mean(dim=1, keepdim=True)
-        step_ratio = td["step_count"].float() / (2 * td.shape[1])
+        num_nodes = td["nodes"].shape[1]
+        step_ratio = td["step_count"].float() / (2 * num_nodes)
+
         state_features = torch.cat([avg_current, unconnected_ratio, step_ratio], dim=1)
 
         # Trajectory Head의 임베딩을 컨텍스트로 사용
@@ -312,16 +314,54 @@ class PocatModel(nn.Module):
 
         log_probs, actions = [torch.zeros(td.batch_size[0], device=td.device)], [action]
 
+
+        decoding_step = 0
         while not td["done"].all():
+            decoding_step += 1
+            # --- 👇 [핵심 추가] 디버깅을 위한 상세 로그 출력 ---
+            if log_fn:
+                # POMO 때문에 배치가 확장되었으므로, 첫 번째 샘플(인덱스 0)만 로깅
+                head_idx = td["trajectory_head"][0].item()
+                head_name = node_names[head_idx]
+                
+                log_msg = f"--- Step {decoding_step}: "
+                if head_idx == BATTERY_NODE_IDX:
+                    log_msg += f"Head is at '{head_name}'. Action Type: [Select New Load]"
+                else:
+                    log_msg += f"Head is at '{head_name}'. Action Type: [Find Parent]"
+                log_fn(log_msg)
+            # --- 로그 추가 완료 ---
+            
             scores = self.decoder(td, cache)
             mask = env.get_action_mask(td).squeeze(1)
+            # --- 👇 [핵심 추가] 마스크 상태 로깅 ---
+            if log_fn:
+                # 첫 번째 샘플의 마스크에서 유효한 행동(True)의 개수 로깅
+                num_valid_actions = mask[0].sum().item()
+                log_fn(f"    - Valid actions before masking: {num_valid_actions}")
+                if num_valid_actions == 0:
+                    log_fn("    - ⚠️ WARNING: No valid actions available. Expect NaN soon.")
+            # --- 로그 추가 완료 ---
+
             scores.masked_fill_(~mask, -float('inf'))
             
             log_prob = F.log_softmax(scores, dim=-1)
             probs = log_prob.exp()
-            
+            # --- 👇 [핵심 추가] 확률 분포 로깅 ---
+            if torch.isnan(log_prob).any():
+                log_fn("    - 🔴 ERROR: log_prob contains NaN!")
+            # --- 로그 추가 완료 ---
+
             action = probs.argmax(dim=-1) if decode_type == 'greedy' else Categorical(probs=probs).sample()
-            
+            # --- 👇 [핵심 추가] 선택된 액션 로깅 ---
+            if log_fn:
+                action_idx = action[0].item()
+                action_name = node_names[action_idx]
+                action_prob = probs[0, action_idx].item()
+                log_fn(f"    - Action Selected: '{action_name}' (Prob: {action_prob:.2%})")
+                log_fn("-" * 20)
+            # --- 로그 추가 완료 ---
+
             td.set("action", action.unsqueeze(-1))
             output_td = env.step(td)
             td = output_td["next"]
