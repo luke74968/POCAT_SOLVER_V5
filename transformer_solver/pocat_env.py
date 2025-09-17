@@ -27,6 +27,7 @@ class PocatEnv(EnvBase):
         self._make_spec()
         self._set_seed(None) # 생성자에서 호출은 되어 있으나, 아래에 메소드 정의가 필요합니다.
         self.trajectory_head_stacks: List[List[int]] = []
+        self._load_constraint_info()
 
 
     def _make_spec(self):
@@ -43,6 +44,9 @@ class PocatEnv(EnvBase):
             "trajectory_head": UnboundedDiscrete(shape=(1,)),
             "step_count": UnboundedDiscrete(shape=(1,)),
             "node_stages": UnboundedDiscrete(shape=(num_nodes,)),
+            "children_count": UnboundedDiscrete(shape=(num_nodes,)),
+            "is_exclusive_path": Unbounded(shape=(num_nodes,), dtype=torch.bool),
+
         })
         
         self.action_spec = UnboundedDiscrete(shape=(1,))
@@ -51,6 +55,39 @@ class PocatEnv(EnvBase):
     def _set_seed(self, seed: Optional[int] = None):
         if seed is not None:
             torch.manual_seed(seed)
+
+    # 💡 **[변경 3]** 제약조건 정보를 미리 가공하여 저장하는 헬퍼 함수
+    def _load_constraint_info(self):
+        """config 파일에서 제약조건 정보를 로드하고 마스킹에 사용하기 쉽게 가공합니다."""
+        self.node_name_to_idx = {name: i for i, name in enumerate(self.generator.config.node_names)}
+        
+        # Independent Rail 정보
+        self.exclusive_supplier_loads = set()
+        self.exclusive_path_loads = set()
+
+        self.exclusive_path_loads_tensor = torch.tensor([], dtype=torch.long, device=self.device)
+        loads_config = self.generator.config.loads
+        if loads_config:
+            for i, load_cfg in enumerate(loads_config):
+                load_idx = 1 + self.generator.num_ics + i
+                if load_cfg.get("independent_rail_type") == "exclusive_supplier":
+                    self.exclusive_supplier_loads.add(load_idx)
+                elif load_cfg.get("independent_rail_type") == "exclusive_path":
+                    self.exclusive_path_loads.add(load_idx)
+            # set에 정보가 채워진 후 tensor를 생성합니다.
+            self.exclusive_path_loads_tensor = torch.tensor(list(self.exclusive_path_loads), dtype=torch.long, device=self.device)
+
+        # Power Sequence 정보에 f 플래그(동시 허용 여부) 추가
+        self.power_sequences = []
+        for seq in self.generator.config.constraints.get("power_sequences", []):
+            f_flag = seq.get("f", 1)
+            j_idx = self.node_name_to_idx.get(seq['j'])
+            k_idx = self.node_name_to_idx.get(seq['k'])
+            if j_idx is not None and k_idx is not None:
+                self.power_sequences.append((j_idx, k_idx, f_flag))
+
+
+
 
     def select_start_nodes(self, td: TensorDict):
         node_types = td["nodes"][0, :, FEATURE_INDEX["node_type"][0]:FEATURE_INDEX["node_type"][1]].argmax(-1)
@@ -100,6 +137,9 @@ class PocatEnv(EnvBase):
             "unconnected_loads_mask": torch.ones(batch_size, num_nodes, dtype=torch.bool, device=self.device),
             "step_count": torch.zeros(batch_size, 1, dtype=torch.long, device=self.device),
             "node_stages": torch.full((batch_size, num_nodes), -1, dtype=torch.long, device=self.device),
+            "children_count": torch.zeros(batch_size, num_nodes, dtype=torch.long, device=self.device),
+            "is_exclusive_path": torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device),
+
         }, batch_size=[batch_size], device=self.device)
         
         reset_td["node_stages"][:, BATTERY_NODE_IDX] = 0
@@ -165,9 +205,7 @@ class PocatEnv(EnvBase):
                 # --- 👇 [핵심 수정] 선택된 노드가 배터리이면 스택 로직을 건너뜁니다. ---
                 if load_idx == BATTERY_NODE_IDX:
                     continue
-                # --- 수정 완료 ---
-                load_config_idx = load_idx - (1 + self.generator.num_ics)
-                if self.generator.config.loads[load_config_idx].get("independent_rail_type") is not None:
+                if load_idx in self.exclusive_path_loads:
                     self.trajectory_head_stacks[i].append(BATTERY_NODE_IDX)
 
         # Mode 2: 부모 노드 연결
@@ -179,8 +217,22 @@ class PocatEnv(EnvBase):
             b_idx_node_vec = b_idx[head_is_node]
 
             next_obs["adj_matrix"][b_idx_node_vec, parent_idx_vec, child_idx_vec] = True
-            parent_stages = next_obs["node_stages"][b_idx_node_vec, parent_idx_vec]
-            next_obs["node_stages"][b_idx_node_vec, child_idx_vec] = parent_stages + 1
+
+            # 💡 **[변경 6]** 자식 수 및 경로 상태 업데이트
+            next_obs["children_count"][b_idx_node_vec, parent_idx_vec] += 1
+            # 💡 **[버그 수정]** exclusive_path 상태 전파 로직 개선
+            # 독립 경로로 지정된 부하가 연결되었는지 확인
+            is_child_initially_exclusive = (child_idx_vec.unsqueeze(1) == self.exclusive_path_loads_tensor).any(dim=1)
+            path_starts = torch.where(is_child_initially_exclusive, child_idx_vec, -1)
+
+            # 독립 경로가 시작되었다면
+            if (path_starts != -1).any():
+                active_indices = torch.where(path_starts != -1)[0]
+                # 해당 노드의 모든 조상을 찾음
+                ancestors = self._trace_path_batch(path_starts[active_indices], next_obs["adj_matrix"][b_idx_node_vec[active_indices]])
+                # 모든 조상에게 is_exclusive_path 상태를 True로 전파
+                next_obs["is_exclusive_path"][b_idx_node_vec[active_indices]] |= ancestors
+
             
             # 그 다음, 스택과 같이 개별 상태 전환이 필요한 부분만 for 루프로 처리
             for i in torch.where(head_is_node)[0].tolist():
@@ -235,34 +287,25 @@ class PocatEnv(EnvBase):
         mask = torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device)
         current_head = td["trajectory_head"].squeeze(-1)
 
+        # 💡 디버깅 로그를 위한 설정
+        is_debug_instance = td.batch_size[0] > 0 and td.get("log_mode", "progress") == "detail"
+        debug_idx = td.get("log_idx", 0) if is_debug_instance else -1
+
+
         # Mode 1: 새 Load 선택 마스크
         head_is_battery = (current_head == BATTERY_NODE_IDX)
         if head_is_battery.any():
-            # mask[head_is_battery] = td["unconnected_loads_mask"][head_is_battery]
-
-    
-            # 현재 배터리에 위치한 인스턴스들의 미연결 Load 마스크를 가져옵니다.
-            unconnected_loads_mask_subset = td["unconnected_loads_mask"][head_is_battery]
+            # 💡 **[버그 수정]** 텐서 크기 불일치 오류 해결
+            all_has_unconnected = td["unconnected_loads_mask"].any(dim=-1)
+            is_active = head_is_battery & all_has_unconnected
+            is_finished = head_is_battery & ~all_has_unconnected
             
-            # 아직 연결할 Load가 남았는지 확인합니다.
-            has_unconnected_loads = unconnected_loads_mask_subset.any(dim=-1)
+            if is_active.any():
+                mask[is_active] = td["unconnected_loads_mask"][is_active]
             
-            # --- 👇 [핵심 로직] ---
-            # 1. 아직 연결할 Load가 남은 경우 (has_unconnected_loads == True)
-            #    -> 오직 미연결 Load만 선택할 수 있습니다.
-            if has_unconnected_loads.any():
-                # 배터리에 있으면서, 연결할 Load가 남은 인스턴스들의 인덱스를 찾습니다.
-                instances_with_loads = torch.where(head_is_battery)[0][has_unconnected_loads]
-                # 해당 인스턴스들의 마스크는 미연결 Load 마스크가 됩니다.
-                mask[instances_with_loads] = td["unconnected_loads_mask"][instances_with_loads]
+            if is_finished.any():
+                mask[is_finished, BATTERY_NODE_IDX] = True
 
-            # 2. 모든 Load 연결이 끝난 경우 (has_unconnected_loads == False)
-            #    -> 오직 배터리 자신만 선택할 수 있습니다.
-            if (~has_unconnected_loads).any():
-                # 배터리에 있으면서, 모든 Load 연결이 끝난 인스턴스들의 인덱스를 찾습니다.
-                finished_instances = torch.where(head_is_battery)[0][~has_unconnected_loads]
-                # 해당 인스턴스들의 마스크는 배터리 위치(인덱스 0)만 True가 됩니다.
-                mask[finished_instances, BATTERY_NODE_IDX] = True
     
 
         # Mode 2: 부모 노드 선택 마스크
@@ -272,6 +315,11 @@ class PocatEnv(EnvBase):
             child_nodes = current_head[head_is_node]
             
             can_be_parent = torch.ones(len(b_idx_node), num_nodes, dtype=torch.bool, device=self.device)
+
+            if debug_idx != -1 and debug_idx in b_idx_node.tolist():
+                local_debug_idx = (b_idx_node == debug_idx).nonzero().item()
+                if can_be_parent[local_debug_idx, BATTERY_NODE_IDX]: print("    - [DEBUG] Battery is valid before any constraint.")
+
 
             # 1. 전압 호환성
             # connectivity_matrix[batch, parent, child] -> [b_idx_node, :, child_nodes]
@@ -284,6 +332,98 @@ class PocatEnv(EnvBase):
             # 2. 사이클 방지
             path_mask = self._trace_path_batch(child_nodes, td["adj_matrix"][b_idx_node])
             can_be_parent &= ~path_mask
+
+            if debug_idx != -1 and debug_idx in b_idx_node.tolist():
+                local_debug_idx = (b_idx_node == debug_idx).nonzero().item()
+                if not can_be_parent[local_debug_idx, BATTERY_NODE_IDX]: print("    - [DEBUG] Battery REJECTED by Voltage/Cycle.")
+
+            
+
+            # 3. 전류 한계 마스킹
+            parent_i_limit = td["nodes"][:, :, FEATURE_INDEX["i_limit"]]
+            parent_i_out = td["nodes"][:, :, FEATURE_INDEX["current_out"]]
+            remaining_capacity = (parent_i_limit - parent_i_out)[b_idx_node] # (N_node, num_nodes)
+            child_current_draw = td["nodes"][b_idx_node, child_nodes, FEATURE_INDEX["current_active"]].unsqueeze(1)
+            current_ok = remaining_capacity >= child_current_draw
+            can_be_parent &= current_ok
+            if debug_idx != -1 and debug_idx in b_idx_node.tolist():
+                local_debug_idx = (b_idx_node == debug_idx).nonzero().item()
+                if not can_be_parent[local_debug_idx, BATTERY_NODE_IDX]: print("    - [DEBUG] Battery REJECTED by Current Limit.")
+
+            
+            # 4. Independent Rail 마스킹
+            # 4a. exclusive_supplier: 해당 Load를 자식으로 가지는 부모는 다른 자식을 가질 수 없음
+            for load_idx in self.exclusive_supplier_loads:
+                is_this_child = (child_nodes == load_idx)
+                if is_this_child.any():
+                    # 부모가 될 후보 IC들의 현재 자식 수를 확인
+                    parent_children_count = td["children_count"][b_idx_node[is_this_child]]
+                    # 자식이 이미 1명 이상인 부모는 선택 불가
+                    can_be_parent[is_this_child] &= (parent_children_count == 0)
+
+            # 4b. exclusive_path: 경로 상의 모든 부모는 자식을 1명만 가질 수 있음
+            is_child_exclusive = td["is_exclusive_path"][b_idx_node, child_nodes]
+            if is_child_exclusive.any():
+                instances_to_constrain = torch.where(is_child_exclusive)[0]
+                if len(instances_to_constrain) > 0:
+                    b_idx_constr = b_idx_node[instances_to_constrain]
+
+                    
+                    is_battery_mask = torch.arange(num_nodes, device=self.device) == BATTERY_NODE_IDX
+                    
+                    parent_children_count = td["children_count"][b_idx_constr]
+                    children_ok = (parent_children_count == 0) | is_battery_mask
+                    can_be_parent[instances_to_constrain] &= children_ok
+                    
+                    parent_is_exclusive = td["is_exclusive_path"][b_idx_constr]
+                    exclusive_ok = ~parent_is_exclusive | is_battery_mask
+                    can_be_parent[instances_to_constrain] &= exclusive_ok
+            if debug_idx != -1 and debug_idx in b_idx_node.tolist():
+                local_debug_idx = (b_idx_node == debug_idx).nonzero().item()
+                if not can_be_parent[local_debug_idx, BATTERY_NODE_IDX]: print("    - [DEBUG] Battery REJECTED by Independent Rail.")
+
+
+
+            # 5. Power Sequence 마스킹
+            for j_idx, k_idx, f_flag in self.power_sequences: # Rule: J before K
+                # Case 1: 현재 child가 'k'일 때 (k의 부모를 찾는 중)
+                is_k = (child_nodes == k_idx)
+                if is_k.any():
+                    is_j_connected = td["adj_matrix"][b_idx_node[is_k], :, j_idx].any(dim=-1)
+                    if is_j_connected.any():
+                        instances_to_constrain = torch.where(is_k & is_j_connected.unsqueeze(0).transpose(0, 1))[0]
+                        if len(instances_to_constrain) > 0:
+                            b_idx_constr = b_idx_node[instances_to_constrain]
+                            parent_of_j_idx = td["adj_matrix"][b_idx_constr, :, j_idx].long().argmax(-1)
+                            stage_of_j_parent = td["node_stages"][b_idx_constr, parent_of_j_idx]
+                            candidate_parent_stages = td["node_stages"][b_idx_constr]
+                            is_candidate_unconnected = (candidate_parent_stages == -1)
+                            stage_ok = (candidate_parent_stages > stage_of_j_parent.unsqueeze(1)) if f_flag == 1 else (candidate_parent_stages >= stage_of_j_parent.unsqueeze(1))
+                            can_be_parent[instances_to_constrain] &= is_candidate_unconnected | stage_ok
+
+                    
+                # Case 2: 현재 child가 'j'일 때 (j의 부모를 찾는 중)
+                is_j = (child_nodes == j_idx)
+                if is_j.any():
+                    is_k_connected = td["adj_matrix"][b_idx_node[is_j], :, k_idx].any(dim=-1)
+                    if is_k_connected.any():
+                        instances_to_constrain = torch.where(is_j & is_k_connected.unsqueeze(0).transpose(0, 1))[0]
+                        if len(instances_to_constrain) > 0:
+                            b_idx_constr = b_idx_node[instances_to_constrain]
+                            parent_of_k_idx = td["adj_matrix"][b_idx_constr, :, k_idx].long().argmax(-1)
+                            stage_of_k_parent = td["node_stages"][b_idx_constr, parent_of_k_idx]
+                            candidate_parent_stages = td["node_stages"][b_idx_constr]
+                            is_candidate_unconnected = (candidate_parent_stages == -1)
+                            stage_ok = (candidate_parent_stages < stage_of_k_parent.unsqueeze(1)) if f_flag == 1 else (candidate_parent_stages <= stage_of_k_parent.unsqueeze(1))
+                            can_be_parent[instances_to_constrain] &= is_candidate_unconnected | stage_ok
+                    
+                    if f_flag == 1: # 엄격한 순서일때만 같은 부모 금지
+                        is_parent_of_k = td["adj_matrix"][b_idx_node[is_j], :, k_idx]
+                        can_be_parent[is_j] &= ~is_parent_of_k
+            if debug_idx != -1 and debug_idx in b_idx_node.tolist():
+                local_debug_idx = (b_idx_node == debug_idx).nonzero().item()
+                if not can_be_parent[local_debug_idx, BATTERY_NODE_IDX]: print("    - [DEBUG] Battery REJECTED by Power Sequence.")
+   
 
             mask[head_is_node] = can_be_parent
             
