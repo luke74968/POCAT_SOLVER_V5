@@ -57,21 +57,16 @@ class PocatEnv(EnvBase):
         start_nodes_idx = torch.where(node_types == NODE_TYPE_LOAD)[0]
         return len(start_nodes_idx), start_nodes_idx
     
-    def _trace_path_batch(self, b_idx, start_nodes, adj_matrix):
+    def _trace_path_batch(self, start_nodes: torch.Tensor, adj_matrix: torch.Tensor) -> torch.Tensor:
         """배치 전체에 대해 start_node들의 모든 조상을 찾아 마스크로 반환합니다."""
-        num_nodes = adj_matrix.shape[-1]
-        
-        # 선택된 배치 항목들에 대한 인접 행렬
-        adj_b = adj_matrix[b_idx]
-        
-        # 경로 마스크 초기화 (시작 노드만 True)
-        path_mask = torch.zeros(len(b_idx), num_nodes, dtype=torch.bool, device=self.device)
-        path_mask[torch.arange(len(b_idx)), start_nodes] = True
+        batch_size, num_nodes, _ = adj_matrix.shape
+        path_mask = torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device)
+        path_mask.scatter_(1, start_nodes.unsqueeze(-1), True)
         
         # 행렬 곱셈을 이용해 그래프를 거슬러 올라가며 모든 조상을 찾습니다.
         for _ in range(num_nodes):
             # 현재 경로에 포함된 노드들의 부모를 찾습니다.
-            parents_mask = (adj_b.float() @ path_mask.float().unsqueeze(-1)).squeeze(-1) > 0
+            parents_mask = (adj_matrix.float() @ path_mask.float().unsqueeze(-1)).squeeze(-1).bool()
             # 더 이상 새로운 부모가 없으면 (경로의 끝에 도달하면) 종료합니다.
             if (parents_mask & ~path_mask).sum() == 0: break
             # 새로 찾은 부모들을 경로 마스크에 추가합니다.
@@ -113,18 +108,28 @@ class PocatEnv(EnvBase):
     def step(self, tensordict: TensorDict) -> TensorDict:
         return self._step(tensordict)
 
-    def _calculate_power_loss(self, ic_node_feature: torch.Tensor, i_out: float) -> float:
-        ic_type = ic_node_feature[FEATURE_INDEX["ic_type_idx"]].item()
-        vin = ic_node_feature[FEATURE_INDEX["vin_min"]].item()
-        vout = ic_node_feature[FEATURE_INDEX["vout_min"]].item()
-        if ic_type == 1.0: # LDO
-            op_current = ic_node_feature[FEATURE_INDEX["op_current"]].item()
-            return (vin - vout) * i_out + vin * op_current
-        elif ic_type == 2.0: # Buck
+    def _calculate_power_loss(self, ic_node_features: torch.Tensor, i_out: torch.Tensor) -> torch.Tensor:
+        ic_type = ic_node_features[:, :, FEATURE_INDEX["ic_type_idx"]]
+        vin = ic_node_features[:, :, FEATURE_INDEX["vin_min"]]
+        vout = ic_node_features[:, :, FEATURE_INDEX["vout_min"]]
+
+        power_loss = torch.zeros_like(i_out)
+        
+        # LDO
+        ldo_mask = ic_type == 1.0
+        if ldo_mask.any():
+            op_current = ic_node_features[:, :, FEATURE_INDEX["op_current"]]
+            power_loss[ldo_mask] = (vin[ldo_mask] - vout[ldo_mask]) * i_out[ldo_mask] + vin[ldo_mask] * op_current[ldo_mask]
+        
+        # Buck
+        buck_mask = ic_type == 2.0
+        if buck_mask.any():
             s, e = FEATURE_INDEX["efficiency_params"]
-            a, b, c = ic_node_feature[s:e]
-            return a * (i_out**2) + b * i_out + c
-        return 0
+            a, b, c = ic_node_features[:, :, s:e].permute(2, 0, 1)
+            i_out_buck = i_out[buck_mask]
+            power_loss[buck_mask] = a[buck_mask] * (i_out_buck**2) + b[buck_mask] * i_out_buck + c[buck_mask]
+            
+        return power_loss
 
 
     def _step(self, td: TensorDict) -> TensorDict:
@@ -132,79 +137,85 @@ class PocatEnv(EnvBase):
         if new_batch_size > len(self.trajectory_head_stacks):
             num_repeats = new_batch_size // len(self.trajectory_head_stacks)
             self.trajectory_head_stacks = [
-                stack.copy() for stack in self.trajectory_head_stacks for _ in range(num_repeats)
+                s.copy() for s in self.trajectory_head_stacks for _ in range(num_repeats)
             ]
 
         action = td["action"].squeeze(-1)
         current_head = td["trajectory_head"].squeeze(-1)
         next_obs = td.clone()
-        batch_size = td.batch_size[0]
-        num_nodes = td["nodes"].shape[1]
         
-        for i in range(batch_size):
-            head, act = current_head[i].item(), action[i].item()
-            if head == BATTERY_NODE_IDX:
-                load_idx_in_config = act - (1 + self.generator.num_ics)
-                load_info = self.generator.config.loads[load_idx_in_config]
-                if load_info.get("independent_rail_type") is not None:
-                    self.trajectory_head_stacks[i].append(head)
-                next_obs["trajectory_head"][i] = act
-                next_obs["unconnected_loads_mask"][i, act] = False
-            else:
-                child_idx, parent_idx = head, act
-                next_obs["adj_matrix"][i, parent_idx, child_idx] = True
-                parent_stage = next_obs["node_stages"][i, parent_idx].item()
-                next_obs["node_stages"][i, child_idx] = parent_stage + 1
-                
-                is_parent_connected = (parent_idx == BATTERY_NODE_IDX) or \
-                                      (next_obs["adj_matrix"][i, :, parent_idx].any())
-                
+        b_idx = torch.arange(new_batch_size, device=self.device)
+
+        # Mode 1: 새 Load 선택
+        head_is_battery = (current_head == BATTERY_NODE_IDX)
+        if head_is_battery.any():
+            selected_load = action[head_is_battery]
+            next_obs["trajectory_head"][head_is_battery] = selected_load.unsqueeze(-1)
+            next_obs["unconnected_loads_mask"][head_is_battery, selected_load] = False
+            # 스택 업데이트 (for 루프 유지)
+            for i in torch.where(head_is_battery)[0].tolist():
+                load_idx = action[i].item()
+                load_config_idx = load_idx - (1 + self.generator.num_ics)
+                if self.generator.config.loads[load_config_idx].get("independent_rail_type") is not None:
+                    self.trajectory_head_stacks[i].append(BATTERY_NODE_IDX)
+
+        # Mode 2: 부모 노드 연결
+        head_is_node = ~head_is_battery
+        if head_is_node.any():
+            # 먼저 벡터화된 연산으로 adj_matrix와 stage를 한 번에 업데이트
+            child_idx_vec = current_head[head_is_node]
+            parent_idx_vec = action[head_is_node]
+            b_idx_node_vec = b_idx[head_is_node]
+
+            next_obs["adj_matrix"][b_idx_node_vec, parent_idx_vec, child_idx_vec] = True
+            parent_stages = next_obs["node_stages"][b_idx_node_vec, parent_idx_vec]
+            next_obs["node_stages"][b_idx_node_vec, child_idx_vec] = parent_stages + 1
+            
+            # 그 다음, 스택과 같이 개별 상태 전환이 필요한 부분만 for 루프로 처리
+            for i in torch.where(head_is_node)[0].tolist():
+                parent_for_i = action[i].item()
+                # 메인 트리 연결 여부를 루프 안에서 직접 확인
+                is_parent_connected = (parent_for_i == BATTERY_NODE_IDX) or \
+                                      (next_obs["adj_matrix"][i, :, parent_for_i].any())
+
                 if is_parent_connected:
                     if self.trajectory_head_stacks[i]:
                         next_obs["trajectory_head"][i] = self.trajectory_head_stacks[i].pop()
                     else:
                         next_obs["trajectory_head"][i] = BATTERY_NODE_IDX
                 else:
-                    next_obs["trajectory_head"][i] = parent_idx
-        
-        # 전류 및 온도 업데이트 (배치 연산)
-        new_current_out = (next_obs["adj_matrix"].float().transpose(-1, -2) @ \
-                           next_obs["nodes"][:, :, FEATURE_INDEX["current_active"]].float().unsqueeze(-1)).squeeze(-1)
+                    next_obs["trajectory_head"][i] = parent_for_i
+
+
+        # 전류 및 온도 업데이트 (벡터화)
+        active_currents = next_obs["nodes"][:, :, FEATURE_INDEX["current_active"]]
+        new_current_out = (next_obs["adj_matrix"].float().transpose(-1, -2) @ active_currents.float().unsqueeze(-1)).squeeze(-1)
         next_obs["nodes"][:, :, FEATURE_INDEX["current_out"]] = new_current_out
         
+        power_loss = self._calculate_power_loss(next_obs["nodes"], new_current_out)
+        theta_ja = next_obs["nodes"][:, :, FEATURE_INDEX["theta_ja"]]
         ambient_temp = self.generator.config.constraints.get("ambient_temperature", 25.0)
-        for i in range(batch_size):
-            for n_idx in range(num_nodes):
-                node_feat = next_obs["nodes"][i, n_idx]
-                if node_feat[FEATURE_INDEX["node_type"][0]+NODE_TYPE_IC]:
-                    power_loss = self._calculate_power_loss(node_feat, new_current_out[i, n_idx].item())
-                    theta_ja = node_feat[FEATURE_INDEX["theta_ja"]].item()
-                    next_obs["nodes"][i, n_idx, FEATURE_INDEX["junction_temp"]] = ambient_temp + power_loss * theta_ja
+        new_temp = ambient_temp + power_loss * theta_ja
+        next_obs["nodes"][:, :, FEATURE_INDEX["junction_temp"]] = new_temp
         
-        # --- 👇 [핵심 수정] "갇힌 상태" 또는 "완성 상태"를 미리 감지하여 종료 ---
-        # 1. 다음 상태에서 가능한 행동 마스크를 미리 계산
-        next_mask = self.get_action_mask(next_obs)
-        # 2. 유효한 행동이 하나도 없는지 확인 (갇혔거나, 모든 Load를 연결하고 Battery로 돌아온 완성 상태)
-        is_stuck_or_finished = ~next_mask.any(dim=-1)
+        next_obs.set("step_count", td["step_count"] + 1)
 
-        # 3. 기존 종료 조건들과 결합
+        # 종료 조건
+        next_mask = self.get_action_mask(next_obs)
+        is_stuck_or_finished = ~next_mask.any(dim=-1)
         all_loads_connected = (next_obs["unconnected_loads_mask"].sum(dim=1) == 0)
         trajectory_finished = (next_obs["trajectory_head"].squeeze(-1) == BATTERY_NODE_IDX)
         done_successfully = all_loads_connected & trajectory_finished
-        
         max_steps = 2 * self.generator.num_nodes
         timed_out = (next_obs["step_count"] > max_steps).squeeze(-1)
-        
-        # 성공적으로 끝났거나, 타임아웃이거나, 중간에 갇혔을 때 종료
         is_done = done_successfully | timed_out | is_stuck_or_finished
         next_obs["done"] = is_done.unsqueeze(-1)
-        # --- 수정 완료 ---
         
         return TensorDict({
             "next": next_obs,
             "reward": self.get_reward(next_obs, done_successfully, timed_out, is_stuck_or_finished),
             "done": next_obs["done"],
-        }, batch_size=td.batch_size)
+        }, batch_size=new_batch_size)
 
         
     # 💡 *** 여기가 핵심 수정 부분입니다 ***
@@ -212,91 +223,33 @@ class PocatEnv(EnvBase):
         batch_size, num_nodes, _ = td["nodes"].shape
         mask = torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device)
         current_head = td["trajectory_head"].squeeze(-1)
-        load_configs = self.generator.config.loads
-        num_ics = self.generator.num_ics
 
-        b_idx = torch.arange(batch_size, device=self.device)
+        # Mode 1: 새 Load 선택 마스크
+        head_is_battery = (current_head == BATTERY_NODE_IDX)
+        if head_is_battery.any():
+            mask[head_is_battery] = td["unconnected_loads_mask"][head_is_battery]
 
-        # --- 👇 [핵심 수정] Single-Trajectory 액션 마스킹 로직 ---
-        # Case 1: 현재 헤드가 배터리 -> '새 Load 선택' 마스크 생성
-        head_is_battery_mask = (current_head == BATTERY_NODE_IDX)
-        if head_is_battery_mask.any():
-            mask[head_is_battery_mask] = td["unconnected_loads_mask"][head_is_battery_mask]
-
-        # Phase 1: 현재 경로를 이을 부모 노드 선택
-        head_is_node_mask = ~head_is_battery_mask
-        if head_is_node_mask.any():
-            b_select_parent = b_idx[head_is_node_mask]
-            child_indices = current_head[b_select_parent]
-
-            node_types = td["nodes"][0, :, :FEATURE_INDEX["node_type"][1]].argmax(-1)
+        # Mode 2: 부모 노드 선택 마스크
+        head_is_node = ~head_is_battery
+        if head_is_node.any():
+            b_idx_node = torch.where(head_is_node)[0]
+            child_nodes = current_head[head_is_node]
             
+            can_be_parent = torch.ones(len(b_idx_node), num_nodes, dtype=torch.bool, device=self.device)
 
-            # 1. 기본 자격 정의: 부모는 IC 또는 배터리여야만 함 (Load 원천 배제)
-            parent_candidate_mask = (node_types == NODE_TYPE_IC) | (node_types == NODE_TYPE_BATTERY)
-            can_be_parent = parent_candidate_mask.unsqueeze(0).expand(len(b_idx), -1).clone()
+            # 1. 전압 호환성
+            # connectivity_matrix[batch, parent, child] -> [b_idx_node, :, child_nodes]
+            # PyTorch의 gather를 사용하여 각 배치 항목에 맞는 child 슬라이스를 선택
+            connectivity = td["connectivity_matrix"][b_idx_node] # (N_node, n, n)
+            child_indices_exp = child_nodes.view(-1, 1, 1).expand(-1, num_nodes, 1)
+            volt_ok = torch.gather(connectivity, 2, child_indices_exp).squeeze(-1)
+            can_be_parent &= volt_ok
 
-            # 2. 사이클 방지: 현재 경로의 조상 및 자손은 부모가 될 수 없음
-            #    자기 자신도 포함하여 확실히 제외합니다.
-            ancestor_mask = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"])
-            can_be_parent &= ~ancestor_mask
+            # 2. 사이클 방지
+            path_mask = self._trace_path_batch(child_nodes, td["adj_matrix"][b_idx_node])
+            can_be_parent &= ~path_mask
 
-            # 3. 전압 호환성 검사
-            is_voltage_compatible = td["connectivity_matrix"][b_idx, :, child_indices]
-            can_be_parent &= is_voltage_compatible
-
-            # 4. 전류 한계 검사
-            current_path_mask = self._trace_path_batch(b_idx, child_indices, td["adj_matrix"])
-            path_nodes_currents = (td["nodes"][b_idx, :, FEATURE_INDEX["current_active"]] * current_path_mask).sum(dim=1)
-            current_draw = td["nodes"][b_idx, :, FEATURE_INDEX["current_out"]]
-            prospective_draw = current_draw + path_nodes_currents.unsqueeze(1)
-            parent_limits = td["nodes"][b_idx, :, FEATURE_INDEX["i_limit"]]
-            can_be_parent &= (prospective_draw <= parent_limits) | (parent_limits == 0)
-
-            # 5. 기타 제약조건 (Power Sequence, Independent Rail)
-            constraints, loads_info, node_names = self.generator.config.constraints, self.generator.config.loads, self.generator.config.node_names
-            # ancestors 텐서 생성 시 device를 지정합니다.
-            ancestors = td["adj_matrix"][b_idx].clone().to(self.device) 
-            for _ in range(num_nodes): # 최악의 경우를 대비해 num_nodes 만큼 반복
-                ancestors = ancestors | (ancestors.float() @ ancestors.float()).bool()
-            
-            head_load_idx = child_indices - (1 + len(self.generator.config.available_ics))
-
-            # 아래의 for문은 배치별로 순회하므로 병렬 처리가 어렵지만,
-            # 그 안의 텐서 연산은 이미 GPU에서 수행되도록 변경되었습니다.
-
-            for idx, b in enumerate(b_idx.tolist()):
-                if 0 <= head_load_idx[idx] < len(loads_info):
-                    load = loads_info[head_load_idx[idx]]
-                    rail_type = load.get("independent_rail_type")
-                    # << 수정: 배터리(노드 0)는 이 제약에서 제외하도록 수정 >>
-                    is_not_battery_mask = torch.ones(num_nodes, dtype=torch.bool, device=self.device)
-                    is_not_battery_mask[0] = False
-                    
-                    if rail_type == "exclusive_supplier":
-                        # 이미 자식이 있는 노드는 부모가 될 수 없음 (단, 배터리는 예외)
-                        no_existing_children_mask = td["adj_matrix"][b].sum(dim=1) == 0
-                        can_be_parent[idx] &= (no_existing_children_mask | ~is_not_battery_mask)
-                    elif rail_type == "exclusive_path":
-                        # 이미 자식이 2개 이상 있는 노드는 부모가 될 수 없음 (단, 배터리는 예외)
-                        less_than_two_children_mask = td["adj_matrix"][b].sum(dim=1) <= 1
-                        can_be_parent[idx] &= (less_than_two_children_mask | ~is_not_battery_mask)
-
-            
-            for seq in constraints.get("power_sequences", []):
-                if seq.get("f") != 1: continue
-                j_name, k_name = seq.get("j"), seq.get("k")
-                if j_name not in node_names or k_name not in node_names: continue
-                j_idx, k_idx = node_names.index(j_name), node_names.index(k_name)
-                is_head_k_mask = child_indices == k_idx
-                if is_head_k_mask.any():
-                    can_be_parent[is_head_k_mask] &= ~ancestors[is_head_k_mask, :, j_idx]
-                        # 1. 부하는 부모가 될 수 없음
-            is_load = (node_types == NODE_TYPE_LOAD)
-            can_be_parent &= ~is_load.unsqueeze(0)
-
-
-            mask[b_idx] = can_be_parent
+            mask[head_is_node] = can_be_parent
             
         return mask
     
@@ -319,7 +272,6 @@ class PocatEnv(EnvBase):
             reward[done_successfully] = -total_cost
 
         # 중간에 갇히거나 타임아웃으로 실패한 경우: 큰 패널티
-        # (성공적으로 끝난 경우는 제외하고 패널티 부여)
         failed = (timed_out | is_stuck_or_finished) & ~done_successfully
         if failed.any():
             reward[failed] -= 100.0 # 예시 패널티 값
