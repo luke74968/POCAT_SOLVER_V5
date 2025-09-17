@@ -274,13 +274,14 @@ class PocatModel(nn.Module):
         # 💡 [CaDA 장점 적용 4] GRUCell 제거 (상태 기반 쿼리로 대체)
         # self.context_gru = nn.GRUCell(model_params['embedding_dim'] * 2, model_params['embedding_dim'])
 
-    def forward(self, td: TensorDict, env: PocatEnv, decode_type: str = 'greedy', pbar: object = None, status_msg: str = "", log_fn=None):
+    def forward(self, td: TensorDict, env: PocatEnv, decode_type: str = 'greedy', pbar: object = None,
+                status_msg: str = "", log_fn=None, log_idx: int = 0, log_mode: str = 'progress'):
         base_desc = pbar.desc.split(' | ')[0] if pbar else ""
         
         if pbar:
             desc = f"{base_desc} | {status_msg} | ▶ Encoding (ing..)"
             pbar.set_description(desc)
-            if log_fn: log_fn(desc)
+            if log_fn and log_mode == 'detail': log_fn(desc)
         
         # 1. 인코딩
         prompt_embedding = self.prompt_net(td["scalar_prompt_features"], td["matrix_prompt_features"])
@@ -318,10 +319,16 @@ class PocatModel(nn.Module):
         decoding_step = 0
         while not td["done"].all():
             decoding_step += 1
-            # --- 👇 [핵심 추가] 디버깅을 위한 상세 로그 출력 ---
-            if log_fn:
-                # POMO 때문에 배치가 확장되었으므로, 첫 번째 샘플(인덱스 0)만 로깅
-                head_idx = td["trajectory_head"][0].item()
+            
+            scores = self.decoder(td, cache)
+            mask = env.get_action_mask(td)
+            # log_mode에 따라 다른 로그 출력
+            if log_mode == 'detail' and log_fn:
+                # 안전장치: log_idx가 배치 크기를 벗어나지 않도록 확인
+                if log_idx >= td.batch_size[0]:
+                    log_idx = 0
+
+                head_idx = td["trajectory_head"][log_idx].item()
                 head_name = node_names[head_idx]
                 
                 log_msg = f"--- Step {decoding_step}: "
@@ -330,37 +337,46 @@ class PocatModel(nn.Module):
                 else:
                     log_msg += f"Head is at '{head_name}'. Action Type: [Find Parent]"
                 log_fn(log_msg)
-            # --- 로그 추가 완료 ---
-            
-            scores = self.decoder(td, cache)
-            mask = env.get_action_mask(td)
-            # --- 👇 [핵심 추가] 마스크 상태 로깅 ---
-            if log_fn:
-                # 첫 번째 샘플의 마스크에서 유효한 행동(True)의 개수 로깅
-                num_valid_actions = mask[0].sum().item()
+
+                num_valid_actions = mask[log_idx].sum().item()
                 log_fn(f"    - Valid actions before masking: {num_valid_actions}")
-                if num_valid_actions == 0:
-                    log_fn("    - ⚠️ WARNING: No valid actions available. Expect NaN soon.")
-            # --- 로그 추가 완료 ---
+
+                instance_scores = scores[log_idx].clone()
+                valid_scores = instance_scores[mask[log_idx]]
+                
+                top_k = min(5, len(valid_scores))
+                if top_k > 0:
+                    top_scores, top_indices_in_valid = torch.topk(valid_scores, k=top_k)
+                    valid_node_indices = torch.where(mask[log_idx])[0]
+                    top_node_indices = valid_node_indices[top_indices_in_valid]
+                    
+                    log_fn("    - Top 5 Action Scores (pre-mask):")
+                    for i in range(top_k):
+                        node_idx = top_node_indices[i].item()
+                        score = top_scores[i].item()
+                        node_name = node_names[node_idx]
+                        log_fn(f"        - {node_name:<40s} | Score: {score:.4f}")
+
+            elif log_mode == 'progress' and pbar:
+                unconnected_loads = td['unconnected_loads_mask'][0].sum().item()
+                connected_loads = num_total_loads - unconnected_loads
+                progress_msg = f"Connecting Loads ({connected_loads}/{num_total_loads})"
+                desc = f"{base_desc} | {status_msg} | {progress_msg}"
+                pbar.set_description(desc)
 
             scores.masked_fill_(~mask, -float('inf'))
             
             log_prob = F.log_softmax(scores, dim=-1)
             probs = log_prob.exp()
-            # --- 👇 [핵심 추가] 확률 분포 로깅 ---
-            if torch.isnan(log_prob).any():
-                log_fn("    - 🔴 ERROR: log_prob contains NaN!")
-            # --- 로그 추가 완료 ---
 
             action = probs.argmax(dim=-1) if decode_type == 'greedy' else Categorical(probs=probs).sample()
-            # --- 👇 [핵심 추가] 선택된 액션 로깅 ---
-            if log_fn:
-                action_idx = action[0].item()
-                action_name = node_names[action_idx]
-                action_prob = probs[0, action_idx].item()
+
+            if log_mode == 'detail' and log_fn:
+                action_idx_log = action[log_idx].item()
+                action_name = node_names[action_idx_log]
+                action_prob = probs[log_idx, action_idx_log].item()
                 log_fn(f"    - Action Selected: '{action_name}' (Prob: {action_prob:.2%})")
                 log_fn("-" * 20)
-            # --- 로그 추가 완료 ---
 
             td.set("action", action.unsqueeze(-1))
             output_td = env.step(td)
@@ -374,3 +390,9 @@ class PocatModel(nn.Module):
             "log_likelihood": torch.stack(log_probs, 1).sum(1),
             "actions": torch.stack(actions, 1)
         }
+
+
+
+
+
+

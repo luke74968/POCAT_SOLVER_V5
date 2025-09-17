@@ -104,7 +104,9 @@ class PocatTrainer:
 
                 model_start_time = time.time()
                 # --- 👇 [핵심] log 함수를 모델에 전달 ---
-                out = self.model(td, self.env, decode_type='sampling', pbar=train_pbar, status_msg=status_message, log_fn=args.log)
+                out = self.model(td, self.env, decode_type='sampling', pbar=train_pbar,
+                                     status_msg=status_message, log_fn=args.log,
+                                     log_idx=args.log_idx, log_mode=args.log_mode)
                 model_time = time.time() - model_start_time
 
                 status_message += f" | ▶ Encoding (done) | ◀ Decoding (done)"

@@ -155,6 +155,10 @@ class PocatEnv(EnvBase):
             # 스택 업데이트 (for 루프 유지)
             for i in torch.where(head_is_battery)[0].tolist():
                 load_idx = action[i].item()
+                # --- 👇 [핵심 수정] 선택된 노드가 배터리이면 스택 로직을 건너뜁니다. ---
+                if load_idx == BATTERY_NODE_IDX:
+                    continue
+                # --- 수정 완료 ---
                 load_config_idx = load_idx - (1 + self.generator.num_ics)
                 if self.generator.config.loads[load_config_idx].get("independent_rail_type") is not None:
                     self.trajectory_head_stacks[i].append(BATTERY_NODE_IDX)
@@ -227,7 +231,32 @@ class PocatEnv(EnvBase):
         # Mode 1: 새 Load 선택 마스크
         head_is_battery = (current_head == BATTERY_NODE_IDX)
         if head_is_battery.any():
-            mask[head_is_battery] = td["unconnected_loads_mask"][head_is_battery]
+            # mask[head_is_battery] = td["unconnected_loads_mask"][head_is_battery]
+
+    
+            # 현재 배터리에 위치한 인스턴스들의 미연결 Load 마스크를 가져옵니다.
+            unconnected_loads_mask_subset = td["unconnected_loads_mask"][head_is_battery]
+            
+            # 아직 연결할 Load가 남았는지 확인합니다.
+            has_unconnected_loads = unconnected_loads_mask_subset.any(dim=-1)
+            
+            # --- 👇 [핵심 로직] ---
+            # 1. 아직 연결할 Load가 남은 경우 (has_unconnected_loads == True)
+            #    -> 오직 미연결 Load만 선택할 수 있습니다.
+            if has_unconnected_loads.any():
+                # 배터리에 있으면서, 연결할 Load가 남은 인스턴스들의 인덱스를 찾습니다.
+                instances_with_loads = torch.where(head_is_battery)[0][has_unconnected_loads]
+                # 해당 인스턴스들의 마스크는 미연결 Load 마스크가 됩니다.
+                mask[instances_with_loads] = td["unconnected_loads_mask"][instances_with_loads]
+
+            # 2. 모든 Load 연결이 끝난 경우 (has_unconnected_loads == False)
+            #    -> 오직 배터리 자신만 선택할 수 있습니다.
+            if (~has_unconnected_loads).any():
+                # 배터리에 있으면서, 모든 Load 연결이 끝난 인스턴스들의 인덱스를 찾습니다.
+                finished_instances = torch.where(head_is_battery)[0][~has_unconnected_loads]
+                # 해당 인스턴스들의 마스크는 배터리 위치(인덱스 0)만 True가 됩니다.
+                mask[finished_instances, BATTERY_NODE_IDX] = True
+    
 
         # Mode 2: 부모 노드 선택 마스크
         head_is_node = ~head_is_battery

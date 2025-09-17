@@ -53,6 +53,11 @@ if __name__ == "__main__":
     # 💡 추론을 위한 인자 추가
     parser.add_argument('--test_only', action='store_true', help="Only run test/inference")
     parser.add_argument('--load_path', type=str, default=None, help="Path to a saved model checkpoint (.pth)")
+    
+    # 💡 로그 관련 인자 추가
+    parser.add_argument('--log_idx', type=int, default=0, help='Instance index to log (for POMO)')
+    parser.add_argument('--log_mode', type=str, default='progress', choices=['progress', 'detail'],
+                        help="Logging mode: 'progress' for progress bar, 'detail' for step-by-step logs.")
 
     args = parser.parse_args()
     
