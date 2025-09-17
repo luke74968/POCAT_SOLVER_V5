@@ -75,9 +75,16 @@ class PocatEnv(EnvBase):
 
     def _reset(self, td: Optional[TensorDict] = None, **kwargs) -> TensorDict:
         batch_size = kwargs.get("batch_size", self.batch_size)
-        if isinstance(batch_size, tuple): batch_size = batch_size[0]
-        
-        td_initial = self.generator(batch_size=batch_size).to(self.device)
+        if td is None:
+            batch_size = kwargs.get("batch_size", self.batch_size)
+            if isinstance(batch_size, tuple): batch_size = batch_size[0]
+            td_initial = self.generator(batch_size=batch_size).to(self.device)
+        # td가 인자로 들어오면, 그 td를 초기 상태로 사용합니다.
+        else:
+            td_initial = td
+            # 배치 크기도 들어온 td에서 가져옵니다.
+            batch_size = td_initial.batch_size[0]
+
         num_nodes = td_initial["nodes"].shape[1]
 
         self.trajectory_head_stacks = [[] for _ in range(batch_size)]
@@ -140,8 +147,8 @@ class PocatEnv(EnvBase):
                 s.copy() for s in self.trajectory_head_stacks for _ in range(num_repeats)
             ]
 
-        action = td["action"].squeeze(-1)
-        current_head = td["trajectory_head"].squeeze(-1)
+        action = td["action"].view(-1)
+        current_head = td["trajectory_head"].view(-1)
         next_obs = td.clone()
         
         b_idx = torch.arange(new_batch_size, device=self.device)

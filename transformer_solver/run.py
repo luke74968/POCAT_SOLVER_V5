@@ -59,6 +59,9 @@ if __name__ == "__main__":
     parser.add_argument('--log_mode', type=str, default='progress', choices=['progress', 'detail'],
                         help="Logging mode: 'progress' for progress bar, 'detail' for step-by-step logs.")
 
+    parser.add_argument('--decode_type', type=str, default='greedy', choices=['greedy', 'sampling'],
+                        help="Decoding strategy for test mode: 'greedy' or 'sampling'.")
+
     args = parser.parse_args()
     
     args.start_time = time.strftime("%Y-%m%d-%H%M%S", time.localtime())
