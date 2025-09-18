@@ -385,41 +385,58 @@ class PocatEnv(EnvBase):
 
 
             # 5. Power Sequence 마스킹
-            for j_idx, k_idx, f_flag in self.power_sequences: # Rule: J before K
+            for j_idx, k_idx, f_flag in self.power_sequences:  # Rule: J before K
                 # Case 1: 현재 child가 'k'일 때 (k의 부모를 찾는 중)
-                is_k = (child_nodes == k_idx)
-                if is_k.any():
-                    is_j_connected = td["adj_matrix"][b_idx_node[is_k], :, j_idx].any(dim=-1)
-                    if is_j_connected.any():
-                        instances_to_constrain = torch.where(is_k & is_j_connected.unsqueeze(0).transpose(0, 1))[0]
-                        if len(instances_to_constrain) > 0:
-                            b_idx_constr = b_idx_node[instances_to_constrain]
-                            parent_of_j_idx = td["adj_matrix"][b_idx_constr, :, j_idx].long().argmax(-1)
-                            stage_of_j_parent = td["node_stages"][b_idx_constr, parent_of_j_idx]
-                            candidate_parent_stages = td["node_stages"][b_idx_constr]
-                            is_candidate_unconnected = (candidate_parent_stages == -1)
-                            stage_ok = (candidate_parent_stages > stage_of_j_parent.unsqueeze(1)) if f_flag == 1 else (candidate_parent_stages >= stage_of_j_parent.unsqueeze(1))
-                            can_be_parent[instances_to_constrain] &= is_candidate_unconnected | stage_ok
+                is_k_mask = (child_nodes == k_idx)
+                if is_k_mask.any():
+                    # j가 이미 연결된 인스턴스들을 찾음
+                    instances_to_check = torch.where(is_k_mask)[0]
+                    b_idx_check = b_idx_node[instances_to_check]
+                    is_j_connected_mask = td["adj_matrix"][b_idx_check, :, j_idx].any(dim=-1)
 
-                    
+                    if is_j_connected_mask.any():
+                        # 제약 조건을 실제로 적용해야 할 인스턴스들
+                        instances_to_constrain_mask = is_j_connected_mask
+                        b_idx_constr = b_idx_check[instances_to_constrain_mask]
+                        
+                        # j의 부모 노드를 찾음
+                        parent_of_j_idx = td["adj_matrix"][b_idx_constr, :, j_idx].long().argmax(-1)
+                        
+                        # j 부모의 모든 조상을 찾아서 마스킹 (k의 부모는 j 부모의 조상이 될 수 없음)
+                        ancestors_of_j_parent_mask = self._trace_path_batch(parent_of_j_idx, td["adj_matrix"][b_idx_constr])
+                        can_be_parent[instances_to_check[instances_to_constrain_mask]] &= ~ancestors_of_j_parent_mask
+                        
+                        if f_flag == 1: # 동일 부모 금지
+                            same_parent_mask = torch.arange(num_nodes, device=self.device) == parent_of_j_idx.unsqueeze(1)
+                            can_be_parent[instances_to_check[instances_to_constrain_mask]] &= ~same_parent_mask
+
                 # Case 2: 현재 child가 'j'일 때 (j의 부모를 찾는 중)
-                is_j = (child_nodes == j_idx)
-                if is_j.any():
-                    is_k_connected = td["adj_matrix"][b_idx_node[is_j], :, k_idx].any(dim=-1)
-                    if is_k_connected.any():
-                        instances_to_constrain = torch.where(is_j & is_k_connected.unsqueeze(0).transpose(0, 1))[0]
-                        if len(instances_to_constrain) > 0:
-                            b_idx_constr = b_idx_node[instances_to_constrain]
-                            parent_of_k_idx = td["adj_matrix"][b_idx_constr, :, k_idx].long().argmax(-1)
-                            stage_of_k_parent = td["node_stages"][b_idx_constr, parent_of_k_idx]
-                            candidate_parent_stages = td["node_stages"][b_idx_constr]
-                            is_candidate_unconnected = (candidate_parent_stages == -1)
-                            stage_ok = (candidate_parent_stages < stage_of_k_parent.unsqueeze(1)) if f_flag == 1 else (candidate_parent_stages <= stage_of_k_parent.unsqueeze(1))
-                            can_be_parent[instances_to_constrain] &= is_candidate_unconnected | stage_ok
-                    
-                    if f_flag == 1: # 엄격한 순서일때만 같은 부모 금지
-                        is_parent_of_k = td["adj_matrix"][b_idx_node[is_j], :, k_idx]
-                        can_be_parent[is_j] &= ~is_parent_of_k
+                is_j_mask = (child_nodes == j_idx)
+                if is_j_mask.any():
+                    # k가 이미 연결된 인스턴스들을 찾음
+                    instances_to_check = torch.where(is_j_mask)[0]
+                    b_idx_check = b_idx_node[instances_to_check]
+                    is_k_connected_mask = td["adj_matrix"][b_idx_check, :, k_idx].any(dim=-1)
+
+                    if is_k_connected_mask.any():
+                        # 제약 조건을 실제로 적용해야 할 인스턴스들
+                        instances_to_constrain_mask = is_k_connected_mask
+                        b_idx_constr = b_idx_check[instances_to_constrain_mask]
+                        
+                        # k의 부모 노드를 찾음
+                        parent_of_k_idx = td["adj_matrix"][b_idx_constr, :, k_idx].long().argmax(-1)
+                        
+                        # k 부모의 모든 조상을 찾아서 마스킹 (j의 부모는 k 부모의 조상이 될 수 없음)
+                        ancestors_of_k_parent_mask = self._trace_path_batch(parent_of_k_idx, td["adj_matrix"][b_idx_constr])
+                        can_be_parent[instances_to_check[instances_to_constrain_mask]] &= ~ancestors_of_k_parent_mask
+                        
+                        if f_flag == 1: # 동일 부모 금지
+                            same_parent_mask = torch.arange(num_nodes, device=self.device) == parent_of_k_idx.unsqueeze(1)
+                            can_be_parent[instances_to_check[instances_to_constrain_mask]] &= ~same_parent_mask
+
+
+
+
             if debug_idx != -1 and debug_idx in b_idx_node.tolist():
                 local_debug_idx = (b_idx_node == debug_idx).nonzero().item()
                 if not can_be_parent[local_debug_idx, BATTERY_NODE_IDX]: print("    - [DEBUG] Battery REJECTED by Power Sequence.")
