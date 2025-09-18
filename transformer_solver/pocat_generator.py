@@ -4,6 +4,8 @@ import torch
 from tensordict import TensorDict
 import copy
 from typing import Dict, Any, List, Tuple
+from collections import defaultdict  # 💡 이 라인을 추가해주세요!
+
 
 from dataclasses import asdict
 from common.pocat_preprocess import prune_dominated_ic_instances
@@ -55,6 +57,12 @@ def expand_ic_instances(available_ics: List[PowerIC], loads: List[Load], battery
     potential_vin = sorted(list(set([battery.vout] + potential_vout)))
     candidate_ics = []
     
+    exclusive_loads_per_vout = defaultdict(int)
+    for load in loads:
+        if load.independent_rail_type in ['exclusive_path', 'exclusive_supplier']:
+            exclusive_loads_per_vout[load.voltage_typical] += 1
+
+
     for template_ic in available_ics:
         for vin in potential_vin:
             for vout in potential_vout:
@@ -68,9 +76,13 @@ def expand_ic_instances(available_ics: List[PowerIC], loads: List[Load], battery
                     continue
                 
                 num_potential_loads = sum(1 for load in loads if load.voltage_typical == vout)
+                extra_instances = exclusive_loads_per_vout[vout]
+                num_to_create = num_potential_loads + extra_instances
+
+
                 group_key = f"{template_ic.name}@{vin:.1f}Vin_{vout:.1f}Vout"
                 
-                for i in range(num_potential_loads):
+                for i in range(num_to_create ):
                     concrete_ic = copy.deepcopy(template_ic)
                     concrete_ic.vin, concrete_ic.vout = vin, vout
                     concrete_ic.name = f"{group_key}_copy{i+1}"
