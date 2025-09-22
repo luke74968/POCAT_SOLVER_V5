@@ -179,8 +179,8 @@ class PocatTrainer:
         self.model.eval()
         logging.info("==================== INFERENCE START ====================")
 
-        # 테스트 환경 리셋 (배치 크기는 1로 고정)
         td = self.env.reset(batch_size=1)
+        _, start_nodes_idx = self.env.select_start_nodes(td)
         
         pbar = tqdm(total=1, desc=f"Solving Power Tree (Mode: {self.args.decode_type})")
         out = self.model(td, self.env, decode_type=self.args.decode_type, pbar=pbar, 
@@ -195,76 +195,62 @@ class PocatTrainer:
         final_cost = -reward[best_idx].item()
         best_action_sequence = actions[best_idx]
 
-        print(f"Generated Power Tree Cost: ${final_cost:.4f}")
-        # --- 👇 [핵심 로직] 행동 시퀀스를 기반으로 (부모, 자식) 연결 관계 재구성 ---
-        action_history = []
-        # 테스트 데이터와 동일한 조건으로 시뮬레이션 환경을 리셋
-        td_sim = self.env._reset(td.clone())
+        best_start_node_idx = start_nodes_idx[best_idx].item()
+        node_names = self.env.generator.config.node_names
+        best_start_node_name = node_names[best_start_node_idx]
+        print(f"\nGenerated Power Tree (Best start: '{best_start_node_name}'), Cost: ${final_cost:.4f}")
 
-        # 첫 번째 행동(시작 Load 선택)은 연결 관계를 만들지 않음
+        # --- 👇 [핵심 수정] 시각화를 위해 Solution 객체 생성 ---
+        td_sim = self.env._reset(td.clone())
         td_sim.set("action", best_action_sequence[0])
         output_td = self.env.step(td_sim)
         td_sim = output_td["next"]
         
-        # 두 번째 행동부터 시뮬레이션하며 연결 관계 추적
+        active_edges = []
         for action_tensor in best_action_sequence[1:]:
-            # 루프 시작 전에 done 상태를 먼저 확인
-            if td_sim["done"].all():
-                break
-
+            if td_sim["done"].all(): break
             current_head = td_sim["trajectory_head"].item()
             action_item = action_tensor.item()
 
-            if current_head != BATTERY_NODE_IDX:
-                action_history.append((action_item, current_head)) # (부모, 자식)
+            parent_name = node_names[action_item]
+            child_name = node_names[current_head]
+            active_edges.append((parent_name, child_name))
 
             td_sim.set("action", action_tensor)
             output_td = self.env.step(td_sim)
             td_sim = output_td["next"]
 
-        self.visualize_result(action_history, final_cost)
-
-
-    def visualize_result(self, action_history, final_cost):
-        """
-        [수정됨] graphviz를 직접 사용하여 간단한 Power Tree 토폴로지를 시각화합니다.
-        """
-        if self.result_dir is None: return
-        os.makedirs(self.result_dir, exist_ok=True)
-
-        # 노드 이름을 가져옵니다.
-        node_names = self.env.generator.config.node_names
-
-        # Digraph 객체 생성
-        dot = Digraph(comment=f"Power Tree Topology - Cost ${final_cost:.4f}")
-        dot.attr('node', shape='box', style='rounded')
-        dot.attr(rankdir='LR', label=f"Solution Cost: ${final_cost:.4f}", labelloc='t')
-
-        # 모든 노드를 그래프에 추가
-        for name in node_names:
-            dot.node(name, name)
+        used_ic_names = {name for name, node_type in zip(node_names, self.env.generator.config.node_types) 
+                         if node_type == NODE_TYPE_IC and (any(name == p for p,c in active_edges) or any(name == c for p,c in active_edges))}
         
-        # (부모, 자식) 연결 관계를 기반으로 엣지 추가
-        for parent_idx, child_idx in action_history:
-            parent_name = node_names[parent_idx]
-            child_name = node_names[child_idx]
-            dot.edge(parent_name, child_name)
+        solution = {
+            'cost': final_cost,
+            'used_ic_names': used_ic_names,
+            'active_edges': active_edges
+        }
+
+        # --- 👇 [핵심 수정] 상세 시각화 함수 호출 ---
+        # Generator에서 원본 객체 정보 로드
+        config = self.env.generator.config
+        battery = Battery(**config.battery)
         
-        # 파일로 저장
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"solution_cost_{final_cost:.4f}_{timestamp}"
-        output_path = os.path.join(self.result_dir, filename)
+        candidate_ics = []
+        for ic_data in config.available_ics:
+            ic_type = ic_data.get('type')
+            if ic_type == 'LDO': candidate_ics.append(LDO(**ic_data))
+            elif ic_type == 'Buck': candidate_ics.append(BuckConverter(**ic_data))
+
+        loads = [Load(**ld) for ld in config.loads]
+        constraints = config.constraints
         
-        try:
-            dot.render(output_path, view=False, format='png', cleanup=True)
-            logging.info(f"Power tree visualization saved to {output_path}.png")
-        except Exception as e:
-            logging.error(f"Failed to render visualization. Is Graphviz installed and in your PATH? Error: {e}")
-
-
-
-
-
+        # 시각화 함수 호출
+        # 파일 저장을 위해 solution_index 추가
+        solution_filename_part = os.path.join(self.result_dir, f'solution_final')
+        print_and_visualize_one_solution(solution, candidate_ics, loads, battery, constraints, solution_index=solution_filename_part)
+        logging.info(f"Power tree visualization saved to {solution_filename_part}.png")
+    
+    # --- 💡 visualize_result 메서드는 더 이상 사용되지 않으므로 삭제해도 무방 ---
+    # def visualize_result(self, ...):
 
 
 

@@ -46,6 +46,8 @@ class PocatEnv(EnvBase):
             "node_stages": UnboundedDiscrete(shape=(num_nodes,)),
             "children_count": UnboundedDiscrete(shape=(num_nodes,)),
             "is_exclusive_path": Unbounded(shape=(num_nodes,), dtype=torch.bool),
+            "has_exclusive_supplier_child": Unbounded(shape=(num_nodes,), dtype=torch.bool),
+
 
         })
         
@@ -68,14 +70,16 @@ class PocatEnv(EnvBase):
         self.exclusive_path_loads_tensor = torch.tensor([], dtype=torch.long, device=self.device)
         loads_config = self.generator.config.loads
         if loads_config:
+            load_start_idx = 1 + self.generator.num_ics
             for i, load_cfg in enumerate(loads_config):
-                load_idx = 1 + self.generator.num_ics + i
+                load_idx = load_start_idx + i
                 if load_cfg.get("independent_rail_type") == "exclusive_supplier":
                     self.exclusive_supplier_loads.add(load_idx)
                 elif load_cfg.get("independent_rail_type") == "exclusive_path":
                     self.exclusive_path_loads.add(load_idx)
             # set에 정보가 채워진 후 tensor를 생성합니다.
-            self.exclusive_path_loads_tensor = torch.tensor(list(self.exclusive_path_loads), dtype=torch.long, device=self.device)
+            if self.exclusive_path_loads:
+                self.exclusive_path_loads_tensor = torch.tensor(list(self.exclusive_path_loads), dtype=torch.long, device=self.device)
 
         # Power Sequence 정보에 f 플래그(동시 허용 여부) 추가
         self.power_sequences = []
@@ -98,7 +102,10 @@ class PocatEnv(EnvBase):
         """배치 전체에 대해 start_node들의 모든 조상을 찾아 마스크로 반환합니다."""
         batch_size, num_nodes, _ = adj_matrix.shape
         path_mask = torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device)
-        path_mask.scatter_(1, start_nodes.unsqueeze(-1), True)
+
+        # start_nodes가 비어있지 않을 때만 scatter_ 실행
+        if start_nodes.numel() > 0:
+            path_mask.scatter_(1, start_nodes.unsqueeze(-1), True)
         
         # 행렬 곱셈을 이용해 그래프를 거슬러 올라가며 모든 조상을 찾습니다.
         for _ in range(num_nodes):
@@ -139,6 +146,8 @@ class PocatEnv(EnvBase):
             "node_stages": torch.full((batch_size, num_nodes), -1, dtype=torch.long, device=self.device),
             "children_count": torch.zeros(batch_size, num_nodes, dtype=torch.long, device=self.device),
             "is_exclusive_path": torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device),
+            "has_exclusive_supplier_child": torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device),
+
 
         }, batch_size=[batch_size], device=self.device)
         
@@ -183,9 +192,7 @@ class PocatEnv(EnvBase):
         new_batch_size = td.batch_size[0]
         if new_batch_size > len(self.trajectory_head_stacks):
             num_repeats = new_batch_size // len(self.trajectory_head_stacks)
-            self.trajectory_head_stacks = [
-                s.copy() for s in self.trajectory_head_stacks for _ in range(num_repeats)
-            ]
+            self.trajectory_head_stacks = [s.copy() for s in self.trajectory_head_stacks for _ in range(num_repeats)]
 
         action = td["action"].view(-1)
         current_head = td["trajectory_head"].view(-1)
@@ -220,35 +227,35 @@ class PocatEnv(EnvBase):
 
             # 💡 **[변경 6]** 자식 수 및 경로 상태 업데이트
             next_obs["children_count"][b_idx_node_vec, parent_idx_vec] += 1
-            # 💡 **[버그 수정]** exclusive_path 상태 전파 로직 개선
-            # 독립 경로로 지정된 부하가 연결되었는지 확인
-            is_child_initially_exclusive = (child_idx_vec.unsqueeze(1) == self.exclusive_path_loads_tensor).any(dim=1)
-            path_starts = torch.where(is_child_initially_exclusive, child_idx_vec, -1)
 
-            # 독립 경로가 시작되었다면
-            if (path_starts != -1).any():
-                active_indices = torch.where(path_starts != -1)[0]
-                # 해당 노드의 모든 조상을 찾음
-                ancestors = self._trace_path_batch(path_starts[active_indices], next_obs["adj_matrix"][b_idx_node_vec[active_indices]])
-                # 모든 조상에게 is_exclusive_path 상태를 True로 전파
-                next_obs["is_exclusive_path"][b_idx_node_vec[active_indices]] |= ancestors
 
-            
-            # 그 다음, 스택과 같이 개별 상태 전환이 필요한 부분만 for 루프로 처리
+            exclusive_supplier_loads_tensor = torch.tensor(list(self.exclusive_supplier_loads), device=self.device)
+            is_child_exclusive_supplier = torch.isin(child_idx_vec, exclusive_supplier_loads_tensor)
+            if is_child_exclusive_supplier.any():
+                b_idx_supplier_start = b_idx_node_vec[is_child_exclusive_supplier]
+                newly_connected_parents = parent_idx_vec[is_child_exclusive_supplier]
+                next_obs["has_exclusive_supplier_child"][b_idx_supplier_start, newly_connected_parents] = True
+
+            is_child_starting_exclusive = torch.isin(child_idx_vec, self.exclusive_path_loads_tensor)
+            if is_child_starting_exclusive.any():
+                b_idx_exclusive_start = b_idx_node_vec[is_child_starting_exclusive]
+                newly_connected_parents = parent_idx_vec[is_child_starting_exclusive]
+                ancestors = self._trace_path_batch(newly_connected_parents, next_obs["adj_matrix"][b_idx_exclusive_start])
+                next_obs["is_exclusive_path"][b_idx_exclusive_start] |= ancestors
+                next_obs["is_exclusive_path"][b_idx_exclusive_start, child_idx_vec[is_child_starting_exclusive]] = True
+
             for i in torch.where(head_is_node)[0].tolist():
                 parent_for_i = action[i].item()
-                # 메인 트리 연결 여부를 루프 안에서 직접 확인
-                is_parent_connected = (parent_for_i == BATTERY_NODE_IDX) or \
-                                      (next_obs["adj_matrix"][i, :, parent_for_i].any())
-
-                if is_parent_connected:
+                is_parent_connected_to_main_tree = (parent_for_i == BATTERY_NODE_IDX) or \
+                                                  (next_obs["adj_matrix"][i, :, parent_for_i].any())
+                
+                if is_parent_connected_to_main_tree:
                     if self.trajectory_head_stacks[i]:
                         next_obs["trajectory_head"][i] = self.trajectory_head_stacks[i].pop()
                     else:
                         next_obs["trajectory_head"][i] = BATTERY_NODE_IDX
                 else:
                     next_obs["trajectory_head"][i] = parent_for_i
-
 
         # 전류 및 온도 업데이트 (벡터화)
         active_currents = next_obs["nodes"][:, :, FEATURE_INDEX["current_active"]]
@@ -350,34 +357,38 @@ class PocatEnv(EnvBase):
                 local_debug_idx = (b_idx_node == debug_idx).nonzero().item()
                 if not can_be_parent[local_debug_idx, BATTERY_NODE_IDX]: print("    - [DEBUG] Battery REJECTED by Current Limit.")
 
-            
-            # 4. Independent Rail 마스킹
-            # 4a. exclusive_supplier: 해당 Load를 자식으로 가지는 부모는 다른 자식을 가질 수 없음
+            is_battery_mask = (torch.arange(num_nodes, device=self.device) == BATTERY_NODE_IDX) 
+            # --- 👇 [핵심 수정 4] Independent Rail 마스킹 로직 ---
+            # 4a. exclusive_supplier:
+            # 규칙 1: exclusive_supplier load는 자식이 없는 부모에만 연결 가능
             for load_idx in self.exclusive_supplier_loads:
                 is_this_child = (child_nodes == load_idx)
                 if is_this_child.any():
-                    # 부모가 될 후보 IC들의 현재 자식 수를 확인
                     parent_children_count = td["children_count"][b_idx_node[is_this_child]]
-                    # 자식이 이미 1명 이상인 부모는 선택 불가
                     can_be_parent[is_this_child] &= (parent_children_count == 0)
+            
+            # 규칙 2: 이미 exclusive_supplier 자식을 가진 부모는 다른 자식을 받을 수 없음
+            parent_has_exclusive_child = td["has_exclusive_supplier_child"][b_idx_node]
+            can_be_parent &= ~parent_has_exclusive_child
 
-            # 4b. exclusive_path: 경로 상의 모든 부모는 자식을 1명만 가질 수 있음
-            is_child_exclusive = td["is_exclusive_path"][b_idx_node, child_nodes]
-            if is_child_exclusive.any():
-                instances_to_constrain = torch.where(is_child_exclusive)[0]
-                if len(instances_to_constrain) > 0:
-                    b_idx_constr = b_idx_node[instances_to_constrain]
+            # 4b. exclusive_path:
+            # 규칙 1: 이미 exclusive path에 속한 부모는, 자식이 있다면 추가 자식을 받을 수 없음
+            parent_is_on_exclusive_path = td["is_exclusive_path"][b_idx_node]
+            parent_has_children = td["children_count"][b_idx_node] > 0
+            parent_path_ok = ~(parent_is_on_exclusive_path & parent_has_children) | is_battery_mask
+            can_be_parent &= parent_path_ok
+            
+            # 규칙 2: 새로운 exclusive path를 시작하는 자식은 자식이 없는 부모에만 연결 가능
+            child_is_starting_exclusive = torch.isin(child_nodes, self.exclusive_path_loads_tensor)
+            if child_is_starting_exclusive.any():
+                instances_to_check = torch.where(child_is_starting_exclusive)[0]
+                parent_children_count_check = td["children_count"][b_idx_node[instances_to_check]]
+                k = len(instances_to_check)
+                is_battery_mask_slice = is_battery_mask.expand(k, -1)
+                start_path_ok = (parent_children_count_check == 0) | is_battery_mask_slice
+                can_be_parent[instances_to_check] &= start_path_ok
 
-                    
-                    is_battery_mask = torch.arange(num_nodes, device=self.device) == BATTERY_NODE_IDX
-                    
-                    parent_children_count = td["children_count"][b_idx_constr]
-                    children_ok = (parent_children_count == 0) | is_battery_mask
-                    can_be_parent[instances_to_constrain] &= children_ok
-                    
-                    parent_is_exclusive = td["is_exclusive_path"][b_idx_constr]
-                    exclusive_ok = ~parent_is_exclusive | is_battery_mask
-                    can_be_parent[instances_to_constrain] &= exclusive_ok
+
             if debug_idx != -1 and debug_idx in b_idx_node.tolist():
                 local_debug_idx = (b_idx_node == debug_idx).nonzero().item()
                 if not can_be_parent[local_debug_idx, BATTERY_NODE_IDX]: print("    - [DEBUG] Battery REJECTED by Independent Rail.")

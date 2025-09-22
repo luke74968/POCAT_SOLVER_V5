@@ -23,7 +23,7 @@ optimizer_params:
 
 # 트레이너 파라미터
 trainer_params:
-    epochs: 20
+    epochs: 100
     train_step: 100  # 1 에폭당 훈련 스텝 수
     model_save_interval: 5
     model_load:

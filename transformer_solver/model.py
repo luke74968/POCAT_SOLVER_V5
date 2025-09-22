@@ -365,6 +365,18 @@ class PocatModel(nn.Module):
                 pbar.set_description(desc)
 
             scores.masked_fill_(~mask, -float('inf'))
+
+            # --- 👇 여기부터 수정된 코드입니다 ---
+            # 모든 score가 -inf가 되어버리는 '막다른 길' 상황을 감지합니다.
+            is_stuck = torch.all(scores == -float('inf'), dim=-1)
+            
+            # 막다른 길에 도달한 배치가 있다면,
+            if is_stuck.any():
+                # 해당 배치의 첫 번째 행동(action 0)의 score를 0.0으로 설정합니다.
+                # 이렇게 하면 log_softmax 결과가 [0.0, -inf, -inf, ...]가 되고,
+                # 최종 확률(probs)은 [1.0, 0.0, 0.0, ...]이 되어 오류를 방지할 수 있습니다.
+                scores[is_stuck, 0] = 0.0
+            # --- 👆 여기까지 수정된 코드입니다 ---
             
             log_prob = F.log_softmax(scores, dim=-1)
             probs = log_prob.exp()

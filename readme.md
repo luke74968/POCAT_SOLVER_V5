@@ -19,7 +19,7 @@ python -m or_tools_solver.main config.json
 python -m transformer_solver.run --config_file config_4.json --config_yaml config.yaml --batch_size 1 --log_idx 8 --log_mode detail --decode_type sampling
 
 # 학습된 결과로 Tronsformer based solver test 실행
-python -m transformer_solver.run --config_file config_4.json --test_only --load_path "result/..." --
+python -m transformer_solver.run --config_file config_4.json --test_only --log_mode detail --load_path "result/..." --
 
 
 
