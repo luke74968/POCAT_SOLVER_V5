@@ -20,7 +20,7 @@ class PowerIC:
     operating_current: float; quiescent_current: float; cost: float; theta_ja: float; t_junction_max: int
     load_dump_rating_v: float = 0.0; vin: float = 0.0; vout: float = 0.0
     # --- [핵심 수정] 원래의 전기적 스펙을 저장할 필드 추가 ---
-    original_i_limit: float = field(init=False, default=0.0)
+    original_i_limit: float = 0.0  # <--- 이렇게 수정해주세요!
     # --- 수정 끝 ---
     def calculate_power_loss(self, vin: float, i_out: float) -> float: raise NotImplementedError
     def calculate_input_current(self, vin: float, i_out: float) -> float: raise NotImplementedError

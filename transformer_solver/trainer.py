@@ -180,6 +180,8 @@ class PocatTrainer:
         logging.info("==================== INFERENCE START ====================")
 
         td = self.env.reset(batch_size=1)
+        
+        # --- 👇 [핵심 수정 1] POMO 시작 노드 정보 가져오기 ---
         _, start_nodes_idx = self.env.select_start_nodes(td)
         
         pbar = tqdm(total=1, desc=f"Solving Power Tree (Mode: {self.args.decode_type})")
@@ -195,62 +197,71 @@ class PocatTrainer:
         final_cost = -reward[best_idx].item()
         best_action_sequence = actions[best_idx]
 
+        # --- 👇 [핵심 수정 2] 최적해의 시작 노드 이름 찾기 및 출력 ---
         best_start_node_idx = start_nodes_idx[best_idx].item()
-        node_names = self.env.generator.config.node_names
-        best_start_node_name = node_names[best_start_node_idx]
-        print(f"\nGenerated Power Tree (Best start: '{best_start_node_name}'), Cost: ${final_cost:.4f}")
+        best_start_node_name = self.env.generator.config.node_names[best_start_node_idx]
+        print(f"Generated Power Tree (Best start: '{best_start_node_name}'), Cost: ${final_cost:.4f}")
 
-        # --- 👇 [핵심 수정] 시각화를 위해 Solution 객체 생성 ---
+        action_history = []
         td_sim = self.env._reset(td.clone())
+
         td_sim.set("action", best_action_sequence[0])
         output_td = self.env.step(td_sim)
         td_sim = output_td["next"]
         
-        active_edges = []
         for action_tensor in best_action_sequence[1:]:
             if td_sim["done"].all(): break
             current_head = td_sim["trajectory_head"].item()
             action_item = action_tensor.item()
-
-            parent_name = node_names[action_item]
-            child_name = node_names[current_head]
-            active_edges.append((parent_name, child_name))
-
+            if current_head != BATTERY_NODE_IDX:
+                action_history.append((action_item, current_head))
             td_sim.set("action", action_tensor)
             output_td = self.env.step(td_sim)
             td_sim = output_td["next"]
 
-        used_ic_names = {name for name, node_type in zip(node_names, self.env.generator.config.node_types) 
-                         if node_type == NODE_TYPE_IC and (any(name == p for p,c in active_edges) or any(name == c for p,c in active_edges))}
-        
-        solution = {
-            'cost': final_cost,
-            'used_ic_names': used_ic_names,
-            'active_edges': active_edges
-        }
+        # --- 👇 [핵심 수정 3] 시각화 함수에 시작 노드 이름 전달 ---
+        self.visualize_result(action_history, final_cost, best_start_node_name)
 
-        # --- 👇 [핵심 수정] 상세 시각화 함수 호출 ---
-        # Generator에서 원본 객체 정보 로드
-        config = self.env.generator.config
-        battery = Battery(**config.battery)
-        
-        candidate_ics = []
-        for ic_data in config.available_ics:
-            ic_type = ic_data.get('type')
-            if ic_type == 'LDO': candidate_ics.append(LDO(**ic_data))
-            elif ic_type == 'Buck': candidate_ics.append(BuckConverter(**ic_data))
 
-        loads = [Load(**ld) for ld in config.loads]
-        constraints = config.constraints
+    def visualize_result(self, action_history, final_cost, best_start_node_name):
+        """
+        [수정됨] graphviz를 사용하고 시작 노드 정보를 포함하여 시각화합니다.
+        """
+        if self.result_dir is None: return
+        os.makedirs(self.result_dir, exist_ok=True)
+
+        node_names = self.env.generator.config.node_names
+
+        dot = Digraph(comment=f"Power Tree Topology - Cost ${final_cost:.4f}")
+        dot.attr('node', shape='box', style='rounded')
         
-        # 시각화 함수 호출
-        # 파일 저장을 위해 solution_index 추가
-        solution_filename_part = os.path.join(self.result_dir, f'solution_final')
-        print_and_visualize_one_solution(solution, candidate_ics, loads, battery, constraints, solution_index=solution_filename_part)
-        logging.info(f"Power tree visualization saved to {solution_filename_part}.png")
-    
-    # --- 💡 visualize_result 메서드는 더 이상 사용되지 않으므로 삭제해도 무방 ---
-    # def visualize_result(self, ...):
+        # --- 👇 [핵심 수정 4] 그래프 제목에 시작 노드 정보 추가 ---
+        label_text = f"Best Solution (Started from: {best_start_node_name})\\nCost: ${final_cost:.4f}"
+        dot.attr(rankdir='LR', label=label_text, labelloc='t')
+
+        used_node_indices = set()
+        for parent_idx, child_idx in action_history:
+            used_node_indices.add(parent_idx)
+            used_node_indices.add(child_idx)
+        
+        for node_idx in used_node_indices:
+            node_name = node_names[node_idx]
+            dot.node(node_name, node_name)
+        
+        for parent_idx, child_idx in action_history:
+            parent_name = node_names[parent_idx]
+            child_name = node_names[child_idx]
+            dot.edge(parent_name, child_name)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"solution_cost_{final_cost:.4f}_{timestamp}"
+        output_path = os.path.join(self.result_dir, filename)
+        
+        try:
+            dot.render(output_path, view=False, format='png', cleanup=True)
+            logging.info(f"Power tree visualization saved to {output_path}.png")
+        except Exception as e:
+            logging.error(f"Failed to render visualization. Is Graphviz installed and in your PATH? Error: {e}")
 
 
 
