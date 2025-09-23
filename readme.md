@@ -17,10 +17,10 @@ Set-ExecutionPolicy Bypass -Scope Process
 python -m or_tools_solver.main config.json
 # Tronsformer based solver 학습 실행
 python -m transformer_solver.run --config_file config_4.json --config_yaml config.yaml --batch_size 1 --log_idx 8 --log_mode detail --decode_type sampling
-
+python -m transformer_solver.run --config_file config_4.json --config_yaml config.yaml --batch_size 256 --log_idx 8 --log_mode progress  --decode_type sampling     
 # 학습된 결과로 Tronsformer based solver test 실행
 python -m transformer_solver.run --config_file config_4.json --test_only --log_mode detail --load_path "result/..." --
-
+python -m transformer_solver.run --test_only --config_file config_4.json --log_mode detail --log_idx 0 --load_path "result\2025-0923-174528\epoch-5.pth"     
 
 
 

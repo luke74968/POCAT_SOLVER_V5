@@ -15,6 +15,7 @@ __pycache__/
 *.png
 
 # text 무시
+.txt 
 
 #log.txt
 result/
