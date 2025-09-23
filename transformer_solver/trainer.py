@@ -20,6 +20,17 @@ from .pocat_env import BATTERY_NODE_IDX
 from graphviz import Digraph
 
 
+def update_progress(pbar, metrics):
+    if pbar is None:
+        return
+    pbar.set_postfix({
+        "Loss": f"{metrics['Loss']:.4f}",
+        "Avg Cost": f"${metrics['Avg Cost']:.2f}",
+        "Min Cost": f"${metrics['Min Cost']:.2f}",
+        "T_Reset": f"{metrics['T_Reset']:.0f}ms",
+    }, refresh=False)
+    pbar.update(1)
+
 
 def cal_model_size(model, log_func):
     param_count = sum(param.nelement() for param in model.parameters())
@@ -85,44 +96,35 @@ class PocatTrainer:
             
             self.model.train()
             
-            train_pbar = tqdm(range(1, args.trainer_params['train_step'] + 1), 
-                              desc=f"Epoch {epoch}/{args.trainer_params['epochs']}", 
-                              ncols=140)
+            total_steps = args.trainer_params['train_step']
+            train_pbar = tqdm(
+                total=total_steps,
+                desc=f"Epoch {epoch}",
+                dynamic_ncols=True,
+                leave=False,
+                miniters=1,
+                mininterval=0.1,
+                smoothing=0.1,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+            )
             
             total_loss = 0.0
             total_cost = 0.0
             min_epoch_cost = float('inf') # 💡 **[변경 1]** 에포크 내 최소 비용을 기록할 변수 추가
 
-            for step in train_pbar:
-                step_start_time = time.time()
+            for step in range(1, total_steps + 1):
                 self.optimizer.zero_grad()
                 
-                base_desc = f"Epoch {epoch} (Step {step})"
-                status_message = f"🔄 Env Reset (ing..)"
-                
-                # --- 👇 [핵심] tqdm 설명 설정과 동시에 로그 기록 ---
-                train_pbar.set_description(f"{base_desc} | {status_message}")
-                args.log(train_pbar.desc)
-
                 reset_start_time = time.time()
                 td = self.env.reset(batch_size=args.batch_size)
                 reset_time = time.time() - reset_start_time
                 
-                status_message = f"🔄 Env Reset (done)"
-                train_pbar.set_description(f"{base_desc} | {status_message}")
-                args.log(train_pbar.desc)
-
                 model_start_time = time.time()
                 # --- 👇 [핵심] log 함수를 모델에 전달 ---
                 out = self.model(td, self.env, decode_type='sampling', pbar=train_pbar,
-                                     status_msg=status_message, log_fn=args.log,
+                                     status_msg=None, log_fn=args.log,
                                      log_idx=args.log_idx, log_mode=args.log_mode)
                 model_time = time.time() - model_start_time
-
-                status_message += f" | ▶ Encoding (done) | ◀ Decoding (done)"
-                status_message += f" | 📉 Loss & Bwd (ing..)"
-                train_pbar.set_description(f"{base_desc} | {status_message}")
-                args.log(train_pbar.desc)
                 
                 bwd_start_time = time.time()
                 num_starts = self.env.generator.num_loads
@@ -140,8 +142,17 @@ class PocatTrainer:
 
                 # 가중치 업데이트
                 self.optimizer.step()
-                
+
                 bwd_time = time.time() - bwd_start_time
+
+                logging.debug(
+                    "Epoch %d step %d reset=%.3fms model=%.3fms backward=%.3fms",
+                    epoch,
+                    step,
+                    reset_time * 1000,
+                    model_time * 1000,
+                    bwd_time * 1000,
+                )
 
                 best_reward_per_instance = reward.max(dim=0)[0]
                 
@@ -154,18 +165,26 @@ class PocatTrainer:
                 total_loss += loss.item()
                 total_cost += avg_cost
                 
-                train_pbar.set_postfix({
-                    'Loss': f'{total_loss/step:.4f}',
-                    'Avg Cost': f'${total_cost/step:.2f}',
-                    'Min Cost': f'${min_epoch_cost:.2f}',
-                    'T_Reset': f'{reset_time*1000:.0f}ms',
-                    'T_Model': f'{model_time:.2f}s',
-                    'T_Bwd': f'{bwd_time*1000:.0f}ms'
-                })
-            
-            final_desc = f"Epoch {epoch}/{args.trainer_params['epochs']} | Done"
-            train_pbar.set_description(final_desc)
-            args.log(final_desc) # 에폭 종료 메시지도 로그에 기록
+                update_progress(
+                    train_pbar,
+                    {
+                        "Loss": loss.item(),
+                        "Avg Cost": total_cost / step,
+                        "Min Cost": min_epoch_cost,
+                        "T_Reset": reset_time * 1000,
+                    },
+                )
+
+            train_pbar.close()
+
+            epoch_summary = (
+                f"Epoch {epoch}/{args.trainer_params['epochs']} | "
+                f"Loss {total_loss / total_steps:.4f} | "
+                f"Avg Cost ${total_cost / total_steps:.2f} | "
+                f"Min Cost ${min_epoch_cost:.2f}"
+            )
+            tqdm.write(epoch_summary)
+            args.log(epoch_summary) # 에폭 종료 메시지도 로그에 기록
 
             self.scheduler.step()
             self.time_estimator.print_est_time(epoch, args.trainer_params['epochs'])
