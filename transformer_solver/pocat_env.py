@@ -3,7 +3,7 @@
 import torch
 from tensordict import TensorDict
 from torchrl.envs import EnvBase
-from typing import Optional, List
+from typing import Optional
 
 from torchrl.data import Unbounded , UnboundedDiscrete
 from torchrl.data import CompositeSpec
@@ -26,7 +26,6 @@ class PocatEnv(EnvBase):
         self.generator = PocatGenerator(**generator_params)
         self._make_spec()
         self._set_seed(None) # 생성자에서 호출은 되어 있으나, 아래에 메소드 정의가 필요합니다.
-        self.trajectory_head_stacks: List[List[int]] = []
         self._load_constraint_info()
 
 
@@ -47,8 +46,8 @@ class PocatEnv(EnvBase):
             "children_count": UnboundedDiscrete(shape=(num_nodes,)),
             "is_exclusive_path": Unbounded(shape=(num_nodes,), dtype=torch.bool),
             "has_exclusive_supplier_child": Unbounded(shape=(num_nodes,), dtype=torch.bool),
-
-
+            "trajectory_stack_parents": UnboundedDiscrete(shape=(num_nodes,)),
+            "trajectory_stack_depth": UnboundedDiscrete(shape=(1,)),
         })
         
         self.action_spec = UnboundedDiscrete(shape=(1,))
@@ -67,7 +66,6 @@ class PocatEnv(EnvBase):
         self.exclusive_supplier_loads = set()
         self.exclusive_path_loads = set()
 
-        self.exclusive_path_loads_tensor = torch.tensor([], dtype=torch.long, device=self.device)
         loads_config = self.generator.config.loads
         if loads_config:
             load_start_idx = 1 + self.generator.num_ics
@@ -79,7 +77,17 @@ class PocatEnv(EnvBase):
                     self.exclusive_path_loads.add(load_idx)
             # set에 정보가 채워진 후 tensor를 생성합니다.
             if self.exclusive_path_loads:
-                self.exclusive_path_loads_tensor = torch.tensor(list(self.exclusive_path_loads), dtype=torch.long, device=self.device)
+                self.exclusive_path_loads_tensor = torch.tensor(
+                    sorted(self.exclusive_path_loads), dtype=torch.long, device=self.device
+                )
+        if self.exclusive_supplier_loads:
+            self.exclusive_supplier_loads_tensor = torch.tensor(
+                sorted(self.exclusive_supplier_loads), dtype=torch.long, device=self.device
+            )
+        else:
+            self.exclusive_supplier_loads_tensor = torch.tensor([], dtype=torch.long, device=self.device)
+        if not self.exclusive_path_loads:
+            self.exclusive_path_loads_tensor = torch.tensor([], dtype=torch.long, device=self.device)
 
         # Power Sequence 정보에 f 플래그(동시 허용 여부) 추가
         self.power_sequences = []
@@ -131,8 +139,6 @@ class PocatEnv(EnvBase):
 
         num_nodes = td_initial["nodes"].shape[1]
 
-        self.trajectory_head_stacks = [[] for _ in range(batch_size)]
-
         # --- 💡 1. Trajectory 기반 상태(state) 재정의 ---
         reset_td = TensorDict({
             "nodes": td_initial["nodes"],
@@ -147,8 +153,10 @@ class PocatEnv(EnvBase):
             "children_count": torch.zeros(batch_size, num_nodes, dtype=torch.long, device=self.device),
             "is_exclusive_path": torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device),
             "has_exclusive_supplier_child": torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=self.device),
-
-
+            "trajectory_stack_parents": torch.full(
+                (batch_size, num_nodes), -1, dtype=torch.long, device=self.device
+            ),
+            "trajectory_stack_depth": torch.zeros(batch_size, 1, dtype=torch.long, device=self.device),
         }, batch_size=[batch_size], device=self.device)
         
         reset_td["node_stages"][:, BATTERY_NODE_IDX] = 0
@@ -189,73 +197,80 @@ class PocatEnv(EnvBase):
 
 
     def _step(self, td: TensorDict) -> TensorDict:
-        new_batch_size = td.batch_size[0]
-        if new_batch_size > len(self.trajectory_head_stacks):
-            num_repeats = new_batch_size // len(self.trajectory_head_stacks)
-            self.trajectory_head_stacks = [s.copy() for s in self.trajectory_head_stacks for _ in range(num_repeats)]
-
-        action = td["action"].view(-1)
-        current_head = td["trajectory_head"].view(-1)
+        batch_size = td.batch_size[0]
+        action = td["action"].reshape(batch_size)
+        current_head = td["trajectory_head"].reshape(batch_size)
         next_obs = td.clone()
-        
-        b_idx = torch.arange(new_batch_size, device=self.device)
 
-        # Mode 1: 새 Load 선택
-        head_is_battery = (current_head == BATTERY_NODE_IDX)
+        batch_indices = torch.arange(batch_size, device=self.device)
+
+        head_is_battery = current_head == BATTERY_NODE_IDX
         if head_is_battery.any():
-            selected_load = action[head_is_battery]
-            next_obs["trajectory_head"][head_is_battery] = selected_load.unsqueeze(-1)
-            next_obs["unconnected_loads_mask"][head_is_battery, selected_load] = False
-            # 스택 업데이트 (for 루프 유지)
-            for i in torch.where(head_is_battery)[0].tolist():
-                load_idx = action[i].item()
-                # --- 👇 [핵심 수정] 선택된 노드가 배터리이면 스택 로직을 건너뜁니다. ---
-                if load_idx == BATTERY_NODE_IDX:
-                    continue
-                if load_idx in self.exclusive_path_loads:
-                    self.trajectory_head_stacks[i].append(BATTERY_NODE_IDX)
+            battery_rows = batch_indices[head_is_battery]
+            selected_nodes = action[head_is_battery]
+            next_obs["trajectory_head"][battery_rows, 0] = selected_nodes
+            next_obs["unconnected_loads_mask"][battery_rows, selected_nodes] = False
 
-        # Mode 2: 부모 노드 연결
+            if self.exclusive_path_loads_tensor.numel() > 0:
+                exclusive_selection = torch.isin(selected_nodes, self.exclusive_path_loads_tensor)
+                if exclusive_selection.any():
+                    exclusive_rows = battery_rows[exclusive_selection]
+                    stack_depths = next_obs["trajectory_stack_depth"][exclusive_rows, 0]
+                    next_obs["trajectory_stack_parents"][exclusive_rows, stack_depths] = BATTERY_NODE_IDX
+                    next_obs["trajectory_stack_depth"][exclusive_rows, 0] = stack_depths + 1
+
         head_is_node = ~head_is_battery
         if head_is_node.any():
-            # 먼저 벡터화된 연산으로 adj_matrix와 stage를 한 번에 업데이트
-            child_idx_vec = current_head[head_is_node]
-            parent_idx_vec = action[head_is_node]
-            b_idx_node_vec = b_idx[head_is_node]
+            node_rows = batch_indices[head_is_node]
+            child_indices = current_head[head_is_node]
+            parent_indices = action[head_is_node]
 
-            next_obs["adj_matrix"][b_idx_node_vec, parent_idx_vec, child_idx_vec] = True
+            next_obs["adj_matrix"][node_rows, parent_indices, child_indices] = True
+            next_obs["children_count"][node_rows, parent_indices] += 1
 
-            # 💡 **[변경 6]** 자식 수 및 경로 상태 업데이트
-            next_obs["children_count"][b_idx_node_vec, parent_idx_vec] += 1
+            if self.exclusive_supplier_loads_tensor.numel() > 0:
+                supplier_mask = torch.isin(child_indices, self.exclusive_supplier_loads_tensor)
+                if supplier_mask.any():
+                    supplier_rows = node_rows[supplier_mask]
+                    supplier_parents = parent_indices[supplier_mask]
+                    next_obs["has_exclusive_supplier_child"][supplier_rows, supplier_parents] = True
 
+            if self.exclusive_path_loads_tensor.numel() > 0:
+                exclusive_children = torch.isin(child_indices, self.exclusive_path_loads_tensor)
+                if exclusive_children.any():
+                    exclusive_rows = node_rows[exclusive_children]
+                    exclusive_parents = parent_indices[exclusive_children]
+                    ancestors = self._trace_path_batch(
+                        exclusive_parents, next_obs["adj_matrix"][exclusive_rows]
+                    )
+                    next_obs["is_exclusive_path"][exclusive_rows] |= ancestors
+                    next_obs["is_exclusive_path"][exclusive_rows, child_indices[exclusive_children]] = True
 
-            exclusive_supplier_loads_tensor = torch.tensor(list(self.exclusive_supplier_loads), device=self.device)
-            is_child_exclusive_supplier = torch.isin(child_idx_vec, exclusive_supplier_loads_tensor)
-            if is_child_exclusive_supplier.any():
-                b_idx_supplier_start = b_idx_node_vec[is_child_exclusive_supplier]
-                newly_connected_parents = parent_idx_vec[is_child_exclusive_supplier]
-                next_obs["has_exclusive_supplier_child"][b_idx_supplier_start, newly_connected_parents] = True
+            node_adj = next_obs["adj_matrix"][node_rows]
+            row_range = torch.arange(parent_indices.shape[0], device=self.device)
+            parent_has_parent = node_adj[row_range, :, parent_indices].any(dim=1)
+            parent_connected = (parent_indices == BATTERY_NODE_IDX) | parent_has_parent
 
-            is_child_starting_exclusive = torch.isin(child_idx_vec, self.exclusive_path_loads_tensor)
-            if is_child_starting_exclusive.any():
-                b_idx_exclusive_start = b_idx_node_vec[is_child_starting_exclusive]
-                newly_connected_parents = parent_idx_vec[is_child_starting_exclusive]
-                ancestors = self._trace_path_batch(newly_connected_parents, next_obs["adj_matrix"][b_idx_exclusive_start])
-                next_obs["is_exclusive_path"][b_idx_exclusive_start] |= ancestors
-                next_obs["is_exclusive_path"][b_idx_exclusive_start, child_idx_vec[is_child_starting_exclusive]] = True
+            stack_depths = next_obs["trajectory_stack_depth"][node_rows, 0]
+            pop_mask = parent_connected & (stack_depths > 0)
 
-            for i in torch.where(head_is_node)[0].tolist():
-                parent_for_i = action[i].item()
-                is_parent_connected_to_main_tree = (parent_for_i == BATTERY_NODE_IDX) or \
-                                                  (next_obs["adj_matrix"][i, :, parent_for_i].any())
-                
-                if is_parent_connected_to_main_tree:
-                    if self.trajectory_head_stacks[i]:
-                        next_obs["trajectory_head"][i] = self.trajectory_head_stacks[i].pop()
-                    else:
-                        next_obs["trajectory_head"][i] = BATTERY_NODE_IDX
-                else:
-                    next_obs["trajectory_head"][i] = parent_for_i
+            node_next_head = torch.where(
+                parent_connected,
+                torch.full_like(parent_indices, BATTERY_NODE_IDX),
+                parent_indices,
+            )
+
+            if pop_mask.any():
+                pop_rows = node_rows[pop_mask]
+                pop_indices = stack_depths[pop_mask] - 1
+                popped_values = next_obs["trajectory_stack_parents"][pop_rows, pop_indices]
+                replacement = torch.full_like(node_next_head, BATTERY_NODE_IDX)
+                replacement[pop_mask] = popped_values
+                node_next_head = torch.where(pop_mask, replacement, node_next_head)
+                next_obs["trajectory_stack_depth"][pop_rows, 0] = stack_depths[pop_mask] - 1
+                next_obs["trajectory_stack_parents"][pop_rows, pop_indices] = -1
+
+            next_obs["trajectory_head"][node_rows, 0] = node_next_head
 
         # 전류 및 온도 업데이트 (벡터화)
         active_currents = next_obs["nodes"][:, :, FEATURE_INDEX["current_active"]]
@@ -285,7 +300,7 @@ class PocatEnv(EnvBase):
             "next": next_obs,
             "reward": self.get_reward(next_obs, done_successfully, timed_out, is_stuck_or_finished),
             "done": next_obs["done"],
-        }, batch_size=new_batch_size)
+        }, batch_size=batch_size)
 
         
     # 💡 *** 여기가 핵심 수정 부분입니다 ***

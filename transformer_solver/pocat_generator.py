@@ -125,21 +125,43 @@ class PocatGenerator:
         print(f"🔪 Dominance Pruning 완료: {len(candidate_ic_objs)}개 -> {len(pruned_ics_dicts)}개 최종 인스턴스")
         # --- 수정 완료 ---
         
-        
+        """
         # --- 💡 [핵심 수정] 최종 인스턴스 목록 로그 출력 ---
         print("\n--- ✅ 최종 후보 IC 인스턴스 목록 ---")
         for ic_dict in sorted(pruned_ics_dicts, key=lambda x: x['name']):
             print(f"   - {ic_dict['name']}")
         print("------------------------------------")
         # --- 수정 완료 ---
+        """
         
         config_data['available_ics'] = pruned_ics_dicts # Pruning된 최종 목록 사용
         self.config = PocatConfig(**config_data)
-        
+
         self.num_nodes = len(self.config.node_names)
         self.num_loads = len(self.config.loads)
         self.num_ics = len(self.config.available_ics)
 
+        self._base_tensors = {}
+        self._tensor_cache_by_device = {}
+        self._initialize_base_tensors()
+
+
+    def _initialize_base_tensors(self) -> None:
+        """Pre-compute reusable tensors used to build batches."""
+        node_features = self._create_feature_tensor()
+        connectivity_matrix = self._create_connectivity_matrix(node_features)
+        scalar_prompt_features, matrix_prompt_features = self._create_prompt_tensors()
+
+        # Ensure tensors are detached and not tracked by autograd
+        self._base_tensors = {
+            "nodes": node_features.detach(),
+            "connectivity_matrix": connectivity_matrix.detach(),
+            "scalar_prompt_features": scalar_prompt_features.detach(),
+            "matrix_prompt_features": matrix_prompt_features.detach(),
+        }
+
+        base_device = node_features.device
+        self._tensor_cache_by_device[base_device] = self._base_tensors
 
     def _create_feature_tensor(self) -> torch.Tensor:
         features = torch.zeros(self.num_nodes, FEATURE_DIM)
@@ -218,14 +240,9 @@ class PocatGenerator:
         adj_matrix.diagonal().fill_(False)
         return adj_matrix.to(torch.bool)
 
-
-    def __call__(self, batch_size: int, **kwargs) -> TensorDict:
-        node_features = self._create_feature_tensor()
-        connectivity_matrix = self._create_connectivity_matrix(node_features)
-
+    def _create_prompt_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
         constraints = self.config.constraints
-        # --- 👇 [핵심] 프롬프트 피처를 스칼라와 행렬로 분리하여 생성 ---
-        # 1. 스칼라 피처 생성 (4차원)
+
         scalar_prompt_list = [
             constraints.get("ambient_temperature", 25.0),
             constraints.get("max_sleep_current", 0.0),
@@ -234,29 +251,52 @@ class PocatGenerator:
         ]
         scalar_prompt_features = torch.tensor(scalar_prompt_list, dtype=torch.float32)
 
-        # 2. 시퀀스 제약 조건 행렬 생성 (num_nodes x num_nodes 차원)
         matrix_prompt_features = torch.zeros(self.num_nodes, self.num_nodes, dtype=torch.float32)
         node_name_to_idx = {name: i for i, name in enumerate(self.config.node_names)}
-        
+
         for seq in constraints.get("power_sequences", []):
             if seq.get("f") == 1:
                 j_idx = node_name_to_idx.get(seq['j'])
                 k_idx = node_name_to_idx.get(seq['k'])
                 if j_idx is not None and k_idx is not None:
                     matrix_prompt_features[j_idx, k_idx] = 1.0
-        
-        # --- 수정 완료 ---
 
-        # 배치 크기만큼 확장
-        node_features = node_features.unsqueeze(0).expand(batch_size, -1, -1)
-        scalar_prompt_features = scalar_prompt_features.unsqueeze(0).expand(batch_size, -1)
-        matrix_prompt_features = matrix_prompt_features.unsqueeze(0).expand(batch_size, -1, -1)
-        connectivity_matrix = connectivity_matrix.unsqueeze(0).expand(batch_size, -1, -1)
+        return scalar_prompt_features, matrix_prompt_features
 
+    def _get_device_base_tensors(self, device: Any = None) -> Dict[str, torch.Tensor]:
+        if device is None:
+            # Use the original device used to build the base tensors
+            return next(iter(self._tensor_cache_by_device.values()))
+
+        device = torch.device(device)
+        if device in self._tensor_cache_by_device:
+            return self._tensor_cache_by_device[device]
+
+        # Always move tensors from the initial cache (first entry)
+        base_device, base_tensors = next(iter(self._tensor_cache_by_device.items()))
+        if device == base_device:
+            return base_tensors
+
+        device_tensors = {
+            name: tensor.to(device, non_blocking=True)
+            for name, tensor in base_tensors.items()
+        }
+        self._tensor_cache_by_device[device] = device_tensors
+        return device_tensors
+
+
+    def __call__(self, batch_size: int, **kwargs) -> TensorDict:
+        device = kwargs.get("device", None)
+        base_tensors = self._get_device_base_tensors(device)
+
+        nodes = base_tensors["nodes"].detach().unsqueeze(0).expand(batch_size, -1, -1).clone()
+        scalar_prompt = base_tensors["scalar_prompt_features"].detach().unsqueeze(0).expand(batch_size, -1).clone()
+        matrix_prompt = base_tensors["matrix_prompt_features"].detach().unsqueeze(0).expand(batch_size, -1, -1).clone()
+        connectivity = base_tensors["connectivity_matrix"].detach().unsqueeze(0).expand(batch_size, -1, -1).clone()
         
         return TensorDict({
-            "nodes": node_features, 
-            "scalar_prompt_features": scalar_prompt_features,
-            "matrix_prompt_features": matrix_prompt_features,
-            "connectivity_matrix": connectivity_matrix
+            "nodes": nodes,
+            "scalar_prompt_features": scalar_prompt,
+            "matrix_prompt_features": matrix_prompt,
+            "connectivity_matrix": connectivity
         }, batch_size=[batch_size])
