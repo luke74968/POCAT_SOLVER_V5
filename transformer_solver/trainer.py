@@ -132,6 +132,15 @@ class PocatTrainer:
                 advantage = reward - reward.mean(dim=0, keepdims=True)
                 loss = -(advantage * log_likelihood).mean()
                 loss.backward()
+                
+                # 그래디언트 클리핑 (옵션)
+                max_norm = float(self.args.optimizer_params.get('max_grad_norm', 0))
+                if max_norm > 0:
+                    clip_grad_norms(self.optimizer.param_groups, max_norm=max_norm)
+
+                # 가중치 업데이트
+                self.optimizer.step()
+                
                 bwd_time = time.time() - bwd_start_time
 
                 best_reward_per_instance = reward.max(dim=0)[0]
