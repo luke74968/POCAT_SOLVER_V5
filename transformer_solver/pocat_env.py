@@ -114,16 +114,33 @@ class PocatEnv(EnvBase):
         # start_nodes가 비어있지 않을 때만 scatter_ 실행
         if start_nodes.numel() > 0:
             path_mask.scatter_(1, start_nodes.unsqueeze(-1), True)
-        
+
         # 행렬 곱셈을 이용해 그래프를 거슬러 올라가며 모든 조상을 찾습니다.
         for _ in range(num_nodes):
             # 현재 경로에 포함된 노드들의 부모를 찾습니다.
-            parents_mask = (adj_matrix.float() @ path_mask.float().unsqueeze(-1)).squeeze(-1).bool()
-            # 더 이상 새로운 부모가 없으면 (경로의 끝에 도달하면) 종료합니다.
+            parents_mask = (
+                # Use the transpose to follow incoming edges when accumulating parents.
+                adj_matrix.transpose(-1, -2).float() @ path_mask.float().unsqueeze(-1)
+            ).squeeze(-1).bool()            # 더 이상 새로운 부모가 없으면 (경로의 끝에 도달하면) 종료합니다.
             if (parents_mask & ~path_mask).sum() == 0: break
             # 새로 찾은 부모들을 경로 마스크에 추가합니다.
             path_mask |= parents_mask
-        return path_mask            
+        return path_mask
+
+    def _propagate_exclusive_path_upward(
+        self,
+        obs: TensorDict,
+        rows: torch.Tensor,
+        parent_indices: torch.Tensor,
+        child_indices: torch.Tensor,
+    ) -> None:
+        if rows.numel() == 0:
+            return
+
+        ancestors = self._trace_path_batch(parent_indices, obs["adj_matrix"][rows])
+        obs["is_exclusive_path"][rows] |= ancestors
+        obs["is_exclusive_path"][rows, parent_indices] = True
+        obs["is_exclusive_path"][rows, child_indices] = True
 
     def _reset(self, td: Optional[TensorDict] = None, **kwargs) -> TensorDict:
         batch_size = kwargs.get("batch_size", self.batch_size)
@@ -235,17 +252,23 @@ class PocatEnv(EnvBase):
                     supplier_parents = parent_indices[supplier_mask]
                     next_obs["has_exclusive_supplier_child"][supplier_rows, supplier_parents] = True
 
+            child_already_on_path = next_obs["is_exclusive_path"][node_rows, child_indices]
             if self.exclusive_path_loads_tensor.numel() > 0:
-                exclusive_children = torch.isin(child_indices, self.exclusive_path_loads_tensor)
-                if exclusive_children.any():
-                    exclusive_rows = node_rows[exclusive_children]
-                    exclusive_parents = parent_indices[exclusive_children]
-                    ancestors = self._trace_path_batch(
-                        exclusive_parents, next_obs["adj_matrix"][exclusive_rows]
-                    )
-                    next_obs["is_exclusive_path"][exclusive_rows] |= ancestors
-                    next_obs["is_exclusive_path"][exclusive_rows, child_indices[exclusive_children]] = True
+                child_starts_exclusive = torch.isin(child_indices, self.exclusive_path_loads_tensor)
+            else:
+                child_starts_exclusive = torch.zeros_like(child_already_on_path)
 
+            exclusive_child_mask = child_starts_exclusive | child_already_on_path
+            if exclusive_child_mask.any():
+                exclusive_rows = node_rows[exclusive_child_mask]
+                exclusive_parents = parent_indices[exclusive_child_mask]
+                exclusive_children = child_indices[exclusive_child_mask]
+                self._propagate_exclusive_path_upward(
+                    next_obs,
+                    exclusive_rows,
+                    exclusive_parents,
+                    exclusive_children,
+                )
             node_adj = next_obs["adj_matrix"][node_rows]
             row_range = torch.arange(parent_indices.shape[0], device=self.device)
             parent_has_parent = node_adj[row_range, :, parent_indices].any(dim=1)
@@ -390,8 +413,9 @@ class PocatEnv(EnvBase):
             # 규칙 1: 이미 exclusive path에 속한 부모는, 자식이 있다면 추가 자식을 받을 수 없음
             parent_is_on_exclusive_path = td["is_exclusive_path"][b_idx_node]
             parent_has_children = td["children_count"][b_idx_node] > 0
-            parent_path_ok = ~(parent_is_on_exclusive_path & parent_has_children) | is_battery_mask
-            can_be_parent &= parent_path_ok
+            block_exclusive_reuse = parent_is_on_exclusive_path & parent_has_children
+            block_exclusive_reuse &= (~is_battery_mask).unsqueeze(0).expand_as(block_exclusive_reuse)
+            can_be_parent &= ~block_exclusive_reuse
             
             # 규칙 2: 새로운 exclusive path를 시작하는 자식은 자식이 없는 부모에만 연결 가능
             child_is_starting_exclusive = torch.isin(child_nodes, self.exclusive_path_loads_tensor)
