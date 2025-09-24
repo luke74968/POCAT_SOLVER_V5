@@ -45,7 +45,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # 훈련 관련 인자
     parser.add_argument("--batch_size", type=int, default=64, help="Training batch_size")
- 
+    parser.add_argument("--eval_batch_size", type=int, default=128, help="Evaluation batch size (fixed set)")
+
     parser.add_argument("--config_file", type=str, default="config.json", help="Path to POCAT config file")
     parser.add_argument("--config_yaml", type=str, default="config.yaml", help="Path to model/training config YAML")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed")

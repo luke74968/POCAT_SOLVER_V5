@@ -83,6 +83,11 @@ class PocatTrainer:
             # self.start_epoch = checkpoint['epoch'] + 1        
         self.time_estimator = TimeEstimator(log_fn=args.log)
 
+        self.eval_batch_size = getattr(args, "eval_batch_size", 128)
+        with torch.no_grad():
+            self._eval_td_fixed = self.env.reset(batch_size=self.eval_batch_size).clone()
+        self.best_eval_bom = float("inf")
+
     def run(self):
         args = self.args
         self.time_estimator.reset(self.start_epoch)
@@ -185,6 +190,8 @@ class PocatTrainer:
             )
             tqdm.write(epoch_summary)
             args.log(epoch_summary) # 에폭 종료 메시지도 로그에 기록
+            val = self.evaluate(epoch)
+            self.args.log(f"[Eval] Epoch {epoch} | Avg BOM ${val['avg_bom']:.2f} | Min BOM ${val['min_bom']:.2f}")
 
             self.scheduler.step()
             self.time_estimator.print_est_time(epoch, args.trainer_params['epochs'])
@@ -203,6 +210,50 @@ class PocatTrainer:
 
     # ... (test, visualize_result 메소드는 기존과 동일) ...
     @torch.no_grad()
+    def evaluate(self, epoch: int):
+        """Greedy decode on a fixed validation set, CSV log, and save best checkpoint by avg BOM."""
+        self.model.eval()
+
+        # Rebuild eval TD from the fixed snapshot (same instances every epoch)
+        td_eval = self.env._reset(self._eval_td_fixed.clone())
+
+        # Greedy decoding; reuse your model call signature
+        out = self.model(
+            td_eval, self.env, decode_type='greedy',
+            pbar=None, status_msg="Eval",
+            log_fn=self.args.log, log_idx=self.args.log_idx, log_mode=self.args.log_mode
+        )
+
+        # POMO starts: choose best per instance
+        num_starts = self.env.generator.num_loads
+        reward = out["reward"].view(num_starts, -1)
+        best_reward_per_instance = reward.max(dim=0)[0]
+
+        avg_bom = -best_reward_per_instance.mean().item()
+        min_bom = -best_reward_per_instance.max().item()
+
+        # CSV log
+        import os, torch
+        csv_path = os.path.join(self.result_dir, "val_log.csv")
+        header = not os.path.exists(csv_path)
+        with open(csv_path, "a", encoding="utf-8") as f:
+            if header:
+                f.write("epoch,avg_bom,min_bom,decode_type\n")
+            f.write(f"{epoch},{avg_bom:.4f},{min_bom:.4f},greedy\n")
+
+        # Save best
+        if avg_bom < self.best_eval_bom:
+            self.best_eval_bom = avg_bom
+            save_path = os.path.join(self.result_dir, "best_cost.pth")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+            }, save_path)
+            self.args.log(f"[Eval] ✅ New best avg_bom=${avg_bom:.2f} (min=${min_bom:.2f}) at epoch {epoch} → saved {save_path}")
+
+        return {"avg_bom": avg_bom, "min_bom": min_bom}
+
     def test(self):
         self.model.eval()
         logging.info("==================== INFERENCE START ====================")
