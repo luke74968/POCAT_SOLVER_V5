@@ -268,6 +268,8 @@ class PocatDecoder(nn.Module):
 class PocatModel(nn.Module):
     def __init__(self, **model_params):
         super().__init__()
+        self.logit_clipping = model_params.get('logit_clipping', 10)
+
         self.prompt_net = PocatPromptNet(embedding_dim=model_params['embedding_dim'], num_nodes=model_params['num_nodes'])
         self.encoder = PocatEncoder(**model_params)
         self.decoder = PocatDecoder(**model_params)
@@ -321,6 +323,9 @@ class PocatModel(nn.Module):
             decoding_step += 1
             
             scores = self.decoder(td, cache)
+            # tanh 함수를 이용해 score를 -1과 1 사이로 압축하고,
+            # clipping 값(10)을 곱해 최종 score가 -10과 10 사이를 넘지 않도록 제한합니다.
+            scores = self.logit_clipping * torch.tanh(scores)
             mask = env.get_action_mask(td)
             # log_mode에 따라 다른 로그 출력
             if log_mode == 'detail' and log_fn:
@@ -342,20 +347,24 @@ class PocatModel(nn.Module):
                 log_fn(f"    - Valid actions before masking: {num_valid_actions}")
 
                 instance_scores = scores[log_idx].clone()
+
+                valid_node_indices = torch.where(mask[log_idx])[0]
                 valid_scores = instance_scores[mask[log_idx]]
                 
-                top_k = min(5, len(valid_scores))
-                if top_k > 0:
-                    top_scores, top_indices_in_valid = torch.topk(valid_scores, k=top_k)
-                    valid_node_indices = torch.where(mask[log_idx])[0]
-                    top_node_indices = valid_node_indices[top_indices_in_valid]
+                if len(valid_scores) > 0:
+                    # Softmax 함수를 적용하여 점수를 확률로 변환합니다.
+                    valid_probs = F.softmax(valid_scores, dim=0)
+
+                    # 점수를 기준으로 내림차순 정렬합니다.
+                    sorted_indices = torch.argsort(valid_scores, descending=True)
                     
-                    log_fn("    - Top 5 Action Scores (pre-mask):")
-                    for i in range(top_k):
-                        node_idx = top_node_indices[i].item()
-                        score = top_scores[i].item()
+                    log_fn("    - All Valid Action Scores (pre-mask):")
+                    # 정렬된 순서대로 모든 유효 액션을 출력합니다.
+                    for i in sorted_indices:
+                        node_idx = valid_node_indices[i].item()
+                        prob = valid_probs[i].item() 
                         node_name = node_names[node_idx]
-                        log_fn(f"        - {node_name:<40s} | Score: {score:.4f}")
+                        log_fn(f"        - {node_name:<40s} | Probability: {prob:.2%}")
 
             elif log_mode == 'progress' and pbar:
                 unconnected_loads = td['unconnected_loads_mask'][0].sum().item()

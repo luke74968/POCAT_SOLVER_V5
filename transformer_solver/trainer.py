@@ -4,6 +4,7 @@ from tqdm import tqdm
 import os
 import time # 💡 시간 측정을 위해 time 모듈 추가
 from datetime import datetime
+from collections import defaultdict # 👈 이 줄을 추가해주세요.
 
 import json
 import logging
@@ -14,7 +15,7 @@ from .pocat_env import PocatEnv
 from common.pocat_visualizer import print_and_visualize_one_solution
 
 from common.pocat_classes import Battery, LDO, BuckConverter, Load
-from common.pocat_defs import PocatConfig, NODE_TYPE_IC
+from common.pocat_defs import PocatConfig, NODE_TYPE_IC, FEATURE_INDEX
 from common.config_loader import load_configuration_from_file
 from .pocat_env import BATTERY_NODE_IDX
 from graphviz import Digraph
@@ -299,38 +300,98 @@ class PocatTrainer:
             td_sim = output_td["next"]
 
         # --- 👇 [핵심 수정 3] 시각화 함수에 시작 노드 이름 전달 ---
-        self.visualize_result(action_history, final_cost, best_start_node_name)
+        self.visualize_result(action_history, final_cost, best_start_node_name, td_sim)
 
 
-    def visualize_result(self, action_history, final_cost, best_start_node_name):
+# transformer_solver/trainer.py -> PocatTrainer 클래스 내부에 붙여넣기
+
+    def visualize_result(self, action_history, final_cost, best_start_node_name, final_td):
         """
-        [수정됨] graphviz를 사용하고 시작 노드 정보를 포함하여 시각화합니다.
+        [업그레이드됨] graphviz를 사용하여 각 IC의 상세 상태(전압, 전류, 온도 등)를 포함하여 시각화합니다.
         """
         if self.result_dir is None: return
         os.makedirs(self.result_dir, exist_ok=True)
 
+        # 1. 필요한 정보 추출 및 맵 생성
         node_names = self.env.generator.config.node_names
-
-        dot = Digraph(comment=f"Power Tree Topology - Cost ${final_cost:.4f}")
-        dot.attr('node', shape='box', style='rounded')
+        # --- 👇 [핵심 수정 1] 딕셔너리의 'name' 키를 사용하도록 변경 ---
+        loads_map = {load['name']: load for load in self.env.generator.config.loads}
+        candidate_ics_map = {ic['name']: ic for ic in self.env.generator.config.available_ics}
+        battery = self.env.generator.config.battery
         
-        # --- 👇 [핵심 수정 4] 그래프 제목에 시작 노드 정보 추가 ---
-        label_text = f"Best Solution (Started from: {best_start_node_name})\\nCost: ${final_cost:.4f}"
-        dot.attr(rankdir='LR', label=label_text, labelloc='t')
-
-        used_node_indices = set()
+        final_features = final_td["nodes"][0]
+        
+        # 2. 사용된 IC 및 부하 식별
+        used_node_indices = set([node_names.index(battery['name'])])
+        used_ic_names = set()
         for parent_idx, child_idx in action_history:
             used_node_indices.add(parent_idx)
             used_node_indices.add(child_idx)
+            parent_name = node_names[parent_idx]
+            if parent_name in candidate_ics_map:
+                used_ic_names.add(parent_name)
+
+        # 3. 각 IC의 상세 상태 계산
+        i_ins = {}
+        for ic_name in used_ic_names:
+            ic_config = candidate_ics_map[ic_name]
+            ic_obj = None
+            if ic_config.get('type') == 'LDO':
+                ic_obj = LDO(**ic_config)
+            elif ic_config.get('type') == 'Buck':
+                ic_obj = BuckConverter(**ic_config)
+            
+            if ic_obj:
+                ic_idx = node_names.index(ic_name)
+                i_out_active = final_features[ic_idx, FEATURE_INDEX["current_out"]].item()
+                i_in_active = ic_obj.calculate_input_current(vin=ic_obj.vin, i_out=i_out_active)
+                i_ins[ic_name] = i_in_active
+
+        # 4. Graphviz 그래프 생성
+        dot = Digraph(comment=f"Power Tree Topology - Cost ${final_cost:.4f}")
+        dot.attr('node', shape='box', style='rounded,filled', fontname='Arial')
         
+        label_text = f"Transformer Solution (Started from: {best_start_node_name})\\nCost: ${final_cost:.4f}"
+        dot.attr(rankdir='LR', label=label_text, labelloc='t')
+
+        dot.node(battery['name'], f"🔋 {battery['name']}", shape='Mdiamond', color='darkgreen', fillcolor='white')
+
+        for ic_name in used_ic_names:
+            ic_idx = node_names.index(ic_name)
+            ic_config = candidate_ics_map[ic_name]
+            
+            i_out = final_features[ic_idx, FEATURE_INDEX["current_out"]].item()
+            calculated_tj = final_features[ic_idx, FEATURE_INDEX["junction_temp"]].item()
+            i_in = i_ins.get(ic_name, 0)
+            
+            vin = ic_config.get('vin', 0)
+            vout = ic_config.get('vout', 0)
+            t_junction_max = ic_config.get('t_junction_max', 125)
+            cost = ic_config.get('cost', 0)
+
+            thermal_margin = t_junction_max - calculated_tj
+            node_color = 'blue'
+            if thermal_margin < 10: node_color = 'red'
+            elif thermal_margin < 25: node_color = 'orange'
+
+            label = (f"📦 {ic_name.split('@')[0]}\\n\\n"
+                     f"Vin: {vin:.2f}V, Vout: {vout:.2f}V\\n"
+                     f"Iin: {i_in*1000:.1f}mA (Active)\\n"
+                     f"Iout: {i_out*1000:.1f}mA (Active)\\n"
+                     f"Tj: {calculated_tj:.1f}°C (Max: {t_junction_max}°C)\\n"
+                     f"Cost: ${cost:.2f}")
+            dot.node(ic_name, label, color=node_color, fillcolor='lightgrey', penwidth='3')
+
         for node_idx in used_node_indices:
             node_name = node_names[node_idx]
-            dot.node(node_name, node_name)
-        
+            if node_name in loads_map:
+                # --- 👇 [핵심 수정 2] 딕셔너리 키로 접근하도록 변경 ---
+                load = loads_map[node_name]
+                label = f"💡 {load['name']}\\n{load['voltage_typical']}V | {load['current_active']*1000:.1f}mA"
+                dot.node(node_name, label, color='dimgray', fillcolor='white')
+
         for parent_idx, child_idx in action_history:
-            parent_name = node_names[parent_idx]
-            child_name = node_names[child_idx]
-            dot.edge(parent_name, child_name)
+            dot.edge(node_names[parent_idx], node_names[child_idx])
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"solution_cost_{final_cost:.4f}_{timestamp}"
@@ -338,12 +399,6 @@ class PocatTrainer:
         
         try:
             dot.render(output_path, view=False, format='png', cleanup=True)
-            logging.info(f"Power tree visualization saved to {output_path}.png")
+            logging.info(f"Detailed power tree visualization saved to {output_path}.png")
         except Exception as e:
             logging.error(f"Failed to render visualization. Is Graphviz installed and in your PATH? Error: {e}")
-
-
-
-
-
-

@@ -10,7 +10,11 @@ pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu12
 Set-ExecutionPolicy Bypass -Scope Process
 
 # 2. 가상 환경 활성화
+# window용 
 .\.venv\Scripts\activate.ps1
+# Linux용 
+source .venv/bin/activate
+
 
 # 3. Code 실행
 # OR-TOOLS Solver 실행
