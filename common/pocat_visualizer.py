@@ -219,7 +219,7 @@ def print_and_visualize_one_solution(solution, candidate_ics, loads, battery, co
                 
                 if ic.name in always_on_nodes:
                     # Case 1: IC가 AO 경로에 포함된 경우 (Iop 소모)
-                    total_i_out_sleep = sum(sleep_current_draw.get(c, 0) for c in children_names if c in always_on_nodes)
+                    total_i_out_sleep = sum(sleep_current_draw.get(c, 0) for c in children_names)
                     ic_self_sleep = ic.operating_current
                     
                     if isinstance(ic, LDO):

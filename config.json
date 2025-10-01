@@ -12,7 +12,7 @@
 
   ],
   "loads": [
-    { "name": "MCU_Main", "voltage_req_min": 3.135, "voltage_req_max": 3.465, "voltage_typical": 3.3, "current_active": 0.150, "current_sleep": 0.0001, "independent_rail_type": "exclusive_path" , "always_on_in_sleep": false },
+    { "name": "MCU_Main", "voltage_req_min": 3.135, "voltage_req_max": 3.465, "voltage_typical": 3.3, "current_active": 0.150, "current_sleep": 0.0001, "independent_rail_type": "exclusive_path" , "always_on_in_sleep": true },
     { "name": "Sensor_Bank", "voltage_req_min": 3.135, "voltage_req_max": 3.465, "voltage_typical": 3.3, "current_active": 0.060, "current_sleep": 0.00005 },
     { "name": "CAN_Transceiver", "voltage_req_min": 4.75, "voltage_req_max": 5.25, "voltage_typical": 5.0, "current_active": 0.070, "current_sleep": 0.0001, "independent_rail_type": "exclusive_supplier" , "always_on_in_sleep": true },
     { "name": "RF_Frontend", "voltage_req_min": 3.135, "voltage_req_max": 3.465, "voltage_typical": 3.3, "current_active": 0.300, "current_sleep": 0, "independent_rail_type": "exclusive_supplier" },
@@ -32,8 +32,7 @@
       { "j": "DDR_Core", "k": "eMMC_Memory", "f": 1 }
     ],
     "thermal_margin_percent": 0.10,
-    "max_sleep_current": 1000
-    ,
+    "max_sleep_current": 0.008,
     
     "parallel_search_settings": {
       "enabled": true,

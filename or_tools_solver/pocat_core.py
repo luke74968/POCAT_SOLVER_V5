@@ -480,11 +480,19 @@ def add_sleep_current_constraints(model, battery, candidate_ics, loads, constrai
         child_terms = []
         ub_sum = 0
         for c in children:
-            use_c_sleep = bool_and(edges[(ic.name, c.name)], is_always_on_path[c.name], f"use_sleep_{ic.name}__{c.name}")
+            edge_ic_c = edges[(ic.name, c.name)]
+            
+            # --- 👇 [핵심 수정] 자식이 AO인지 여부를 여기서 판단하지 않습니다. ---
+            #      연결만 되어 있다면 자식의 입력 전류(node_sleep_in)를 그대로 더합니다.
+            #      (기존: use_c_sleep = bool_and(edge_ic_c, is_always_on_path[c.name], ...))
+            use_c_sleep = edge_ic_c
+            # --- 수정 완료 ---
+
             ub_c = node_sleep_ub[c.name]
             term = gate_int_by_bool(node_sleep_in[c.name], ub_c, use_c_sleep, f"sleep_term_{ic.name}__{c.name}")
             child_terms.append(term)
             ub_sum += ub_c
+
 
         children_out = model.NewIntVar(0, max(0, ub_sum), f"sleep_out_{ic.name}")
         model.Add(children_out == (sum(child_terms) if child_terms else 0))
@@ -500,7 +508,7 @@ def add_sleep_current_constraints(model, battery, candidate_ics, loads, constrai
             vin_eff = max(1e-6, vin_ref * eff_sleep)
             p = max(1, int(round(ic.vout * 1000)))
             q = max(1, int(round(vin_eff * 1000)))
-            model.Add(in_for_children * q == children_out * p)
+            model.Add(in_for_children * q >= children_out * p)
         else:
             model.Add(in_for_children == 0)
 
