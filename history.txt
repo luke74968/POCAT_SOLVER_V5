@@ -2,3 +2,6 @@
 
 # Transformer solver가 학습을 하지만
 # Tree 구조가 아닌 Star 구조로 학습 ( Local minima 에 빠짐 ) 하고있음 같은 전압을 사용하는것은 잘 묶고 , 독립조건은 만족하지만 
+
+2025-09-30 
+N POMO 로 변경 (POMO 8번 동시에 돌려서 학습하는거로 )

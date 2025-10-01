@@ -349,6 +349,8 @@ class PocatEnv(EnvBase):
             child_nodes = current_head[head_is_node]
             B_act = len(b_idx_node)
 
+            is_battery_mask = (self.arange_nodes.unsqueeze(0) == BATTERY_NODE_IDX)
+
             # 조건 0a: 부모는 Load 타입이 아니어야 함
             not_load_parent = self.node_type_tensor.unsqueeze(0) != NODE_TYPE_LOAD
 
@@ -374,15 +376,14 @@ class PocatEnv(EnvBase):
             rows = torch.arange(B_act, device=self.device)
             remaining_capacity = nodes_slice[:, :, FEATURE_INDEX["i_limit"]] - nodes_slice[:, :, FEATURE_INDEX["current_out"]]
             child_current_draw = nodes_slice[rows, child_nodes, FEATURE_INDEX["current_active"]].unsqueeze(1)
-            current_ok = remaining_capacity >= child_current_draw
+            current_ok = (remaining_capacity >= child_current_draw) | is_battery_mask
 
             # 조건 4: Independent Rail (전역 규칙 - 잠긴 IC 제외)
-            not_locked = ~td["is_locked_ic_mask"][b_idx_node]
+            not_locked = ~td["is_locked_ic_mask"][b_idx_node] | is_battery_mask
 
             # 조건 5: Independent Rail (상황 규칙 - exclusive 경로의 경우 사용된 IC 제외)
             target_load_idx = td["current_target_load"].squeeze(-1)[head_is_node]
             load_start_idx = 1 + self.generator.num_ics
-            
             target_rail_types = torch.zeros_like(target_load_idx, dtype=torch.long)
             valid_target_mask = (target_load_idx != -1)
             
@@ -395,19 +396,19 @@ class PocatEnv(EnvBase):
                 if in_range_mask.any():
                     final_indices = config_indices[in_range_mask]
                     temp_types = torch.zeros_like(config_indices, dtype=torch.long)
-                    temp_types[in_range_mask] = self.rail_types[final_indices]
+                    temp_types[in_range_mask] = self.rail_types[final_indices].to(self.device)
                     target_rail_types[valid_target_mask] = temp_types
 
             # `exclusive_supplier` (type 1)
             children_count = td["adj_matrix"][b_idx_node].sum(dim=-1)
             is_parent_free = (children_count == 0)
             is_exclusive_supplier = (target_rail_types == 1).unsqueeze(1)
-            supplier_ok = ~(is_exclusive_supplier & ~is_parent_free)
+            supplier_ok = ~(is_exclusive_supplier & ~(is_parent_free | is_battery_mask))
 
             # `exclusive_path` (type 2)
             is_used_mask_slice = td["is_used_ic_mask"][b_idx_node]
             is_exclusive_path = (target_rail_types == 2).unsqueeze(1)
-            path_ok = ~(is_exclusive_path & is_used_mask_slice)
+            path_ok = ~(is_exclusive_path & is_used_mask_slice & ~is_battery_mask)
 
             exclusive_ok = supplier_ok & path_ok & not_locked
 
@@ -443,6 +444,7 @@ class PocatEnv(EnvBase):
                         parent_of_j_idx = adj_j[parent_exists].long().argmax(-1)
                         
                         anc_mask = self._trace_path_batch(parent_of_j_idx, td["adj_matrix"][b_constr])
+                        anc_mask[:, BATTERY_NODE_IDX] = False # 조상 마스크에서 배터리 제외
                         can_be_parent[inst_constr] &= ~anc_mask
                         
                         if f_flag == 1:
@@ -463,6 +465,7 @@ class PocatEnv(EnvBase):
                         parent_of_k_idx = adj_k[parent_exists].long().argmax(-1)
                         
                         anc_mask = self._trace_path_batch(parent_of_k_idx, td["adj_matrix"][b_constr])
+                        anc_mask[:, BATTERY_NODE_IDX] = False # 조상 마스크에서 배터리 제외
                         can_be_parent[inst_constr] &= ~anc_mask
                         
                         if f_flag == 1:

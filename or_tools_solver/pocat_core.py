@@ -234,6 +234,9 @@ def add_power_sequence_constraints(model, candidate_ics, loads, battery, constra
         # stage[c] >= stage[p] + 1
         model.Add(stage[c_name] >= stage[p_name] + 1).OnlyEnforceIf(edge_var)
 
+
+    parent_candidates = [battery] + candidate_ics
+
     # 4. Power Sequence 규칙 적용
     for seq in constraints['power_sequences']:
         if seq.get('f') != 1:
@@ -262,6 +265,9 @@ def add_power_sequence_constraints(model, candidate_ics, loads, battery, constra
         model.Add(k_parent_stage > j_parent_stage)
 
         # 기존의 '동일 부모 금지' 규칙도 함께 적용
+        j_ic_parents = [p for p in j_parents if p[0] != battery.name]
+        k_ic_parents = [p for p in k_parents if p[0] != battery.name]
+
         for p_ic_name, j_edge_var in j_parents:
             for q_ic_name, k_edge_var in k_parents:
                 if p_ic_name == q_ic_name:
@@ -291,7 +297,7 @@ def create_solver_model(candidate_ics, loads, battery, constraints, ic_groups):
     # `parent_nodes`를 올바르게 전달
     add_independent_rail_constraints(model, loads, candidate_ics, all_nodes, parent_nodes, edges)
 
-    is_always_on_path = add_always_on_constraints(model, all_nodes, loads, candidate_ics, edges)
+    is_always_on_path = add_always_on_constraints(model, all_nodes, loads, candidate_ics, battery, edges)
     add_sleep_current_constraints(model, battery, candidate_ics, loads, constraints, edges, is_always_on_path)
 
     # N. 목표 함수 설정
@@ -344,9 +350,13 @@ def add_independent_rail_constraints(model, loads, candidate_ics, all_nodes, par
 
 
 # --- 💡 Always-On 및 Sleep Current 제약조건 함수 ---
-def add_always_on_constraints(model, all_nodes, loads, candidate_ics, edges):
+def add_always_on_constraints(model, all_nodes, loads, candidate_ics, battery, edges):
     all_ic_and_load_nodes = candidate_ics + loads
     is_always_on_path = {node.name: model.NewBoolVar(f"is_ao_{node.name}") for node in all_nodes}
+    
+    # --- 👇 [수정 1] 배터리는 항상 AO(Always-On) 상태로 고정 ---
+    model.Add(is_always_on_path[battery.name] == 1)
+
     for ld in loads:
         model.Add(is_always_on_path[ld.name] == int(ld.always_on_in_sleep))
     for ic in candidate_ics:
@@ -362,214 +372,211 @@ def add_always_on_constraints(model, all_nodes, loads, candidate_ics, edges):
             z_list.append(z)
         for z in z_list: model.Add(is_always_on_path[ic.name] >= z)
         model.Add(is_always_on_path[ic.name] <= sum(z_list))
-    for p in candidate_ics:
-        chs = [c for c in all_ic_and_load_nodes if (p.name, c.name) in edges]
-        for i in range(len(chs) - 1):
-            for j in range(i + 1, len(chs)):
-                c1, c2 = chs[i], chs[j]
-                model.Add(is_always_on_path[c1.name] == is_always_on_path[c2.name]).OnlyEnforceIf([edges[(p.name, c1.name)], edges[(p.name, c2.name)]])
     return is_always_on_path
 
 
 def add_sleep_current_constraints(model, battery, candidate_ics, loads, constraints, edges, is_always_on_path):
     """
-    Sleep-current constraint (battery viewpoint):
-    - AO 레일: Iop 반영
-    - 비-AO '탑레벨'(배터리 직결) 레일: Iq 반영
-    - AO 부하의 sleep 전류를 상위로 전파
-    - LDO: I_in = I_out
-    - Buck: q*I_in = p*I_out  (p/q ≈ Vout / (Vin * eff_guess))
-    - 모든 곱은 Bool 게이팅/정수비로 선형화
+    (최종 개선 로직) Sleep 전류 제약 조건을 추가합니다.
+    - IC 상태 정의:
+        1. is_ao: AO 경로에 포함되어 Iop(동작 전류) 소모
+        2. use_ishut: 비-AO 경로지만, 부모가 AO라서 차단 전류(I_shut 또는 Iq) 소모
+        3. no_current: 비-AO 경로이고, 부모도 비-AO라서 전류 소모 없음
+    - 위 세 상태는 상호 배타적이며, 반드시 하나는 참이 되도록 제약합니다.
     """
-
     SCALE = 1_000_000
     max_sleep = constraints.get('max_sleep_current', 0.0)
     if max_sleep <= 0:
         return
 
-
-
-    # ---------------- helpers ----------------
+    # ... (헬퍼 함수 및 기본 변수 초기화는 이전과 동일) ...
     def bool_and(a, b, name):
-        """w = a AND b (동치)"""
         w = model.NewBoolVar(name)
-        model.Add(w <= a)
-        model.Add(w <= b)
-        model.Add(w >= a + b - 1)
+        model.Add(w <= a); model.Add(w <= b); model.Add(w >= a + b - 1)
         return w
 
     def gate_const_by_bool(const_int, b, name):
-        """y = const if b else 0"""
         y = model.NewIntVar(0, max(0, const_int), name)
-        model.Add(y == const_int).OnlyEnforceIf(b)
-        model.Add(y == 0).OnlyEnforceIf(b.Not())
+        model.Add(y == const_int).OnlyEnforceIf(b); model.Add(y == 0).OnlyEnforceIf(b.Not())
         return y
 
     def gate_int_by_bool(x, ub, b, name):
-        """y = x if b else 0  (x: IntVar, ub: 상한)"""
         y = model.NewIntVar(0, max(0, ub), name)
-        model.Add(y == x).OnlyEnforceIf(b)
-        model.Add(y == 0).OnlyEnforceIf(b.Not())
+        model.Add(y == x).OnlyEnforceIf(b); model.Add(y == 0).OnlyEnforceIf(b.Not())
         return y
 
-    # 넉넉한 상한(UB) 계산
-    total_load_sleep = sum(max(0, int(ld.current_sleep * SCALE)) for ld in loads)
-    total_ic_self = sum(max(0, int(max(ic.operating_current, ic.quiescent_current) * SCALE)) for ic in candidate_ics)
-    NODE_UB = total_load_sleep + total_ic_self + 1
+    parent_nodes = [battery] + candidate_ics
+    all_ic_and_load_nodes = candidate_ics + loads
+    
+    # NODE_UB 계산 시 shutdown_current가 None일 수 있으므로 처리
+    max_ic_self_current = sum(
+        int(max(ic.operating_current, ic.quiescent_current, ic.shutdown_current or 0) * SCALE)
+        for ic in candidate_ics
+    )
+    NODE_UB = max_ic_self_current + sum(int(ld.current_sleep * SCALE) for ld in loads) + 1
 
-    # 각 노드 "입력핀에서 요구하는 슬립전류" 변수 미리 생성
-    node_sleep_in = {}      # name -> IntVar
-    node_sleep_ub = {}      # name -> int(UB)
+    node_sleep_in = {}
+    node_sleep_ub = {}
 
-    # Loads: AO일 때 고정값, 아니면 0
     for ld in loads:
         const_val = max(0, int(ld.current_sleep * SCALE))
-        v = model.NewIntVar(0, const_val, f"sleep_in_{ld.name}")
-        model.Add(v == const_val).OnlyEnforceIf(is_always_on_path[ld.name])
-        model.Add(v == 0).OnlyEnforceIf(is_always_on_path[ld.name].Not())
+        v = gate_const_by_bool(const_val, is_always_on_path[ld.name], f"sleep_in_{ld.name}")
         node_sleep_in[ld.name] = v
         node_sleep_ub[ld.name] = const_val
 
-    # IC들: 우선 빈 변수를 만들어 두고, 아래에서 등식으로 정의
     for ic in candidate_ics:
         node_sleep_in[ic.name] = model.NewIntVar(0, NODE_UB, f"sleep_in_{ic.name}")
         node_sleep_ub[ic.name] = NODE_UB
 
-    # IC별 제약 구성
+    # --- IC별 제약 조건 구성 (개선된 로직) ---
     for ic in candidate_ics:
-        ao_ic = is_always_on_path[ic.name]
-        top_edge = edges.get((battery.name, ic.name), None)
-
-        # (A) 자기소모: AO면 Iop, 비-AO & top이면 Iq, 그 외 0  (세 경우가 딱 한 개만 참)
         iop = max(0, int(ic.operating_current * SCALE))
-        iq  = max(0, int(ic.quiescent_current * SCALE))
-        ic_self = model.NewIntVar(0, max(iop, iq), f"sleep_self_{ic.name}")
-
-        non_ao = model.NewBoolVar(f"non_ao_{ic.name}")
-        model.Add(non_ao + ao_ic == 1)
-
-        if top_edge is not None:
-            # b1 := ao_ic
-            b1 = ao_ic
-            # b2 := (non_ao AND top_edge)
-            b2 = bool_and(non_ao, top_edge, f"non_ao_top_{ic.name}")
-            # b3 := (non_ao AND NOT top_edge)
-            not_top = model.NewBoolVar(f"not_top_{ic.name}")
-            model.Add(not_top + top_edge == 1)
-            b3 = bool_and(non_ao, not_top, f"non_ao_not_top_{ic.name}")
-
-            # 세 경우가 정확히 하나만 성립
-            model.Add(b1 + b2 + b3 == 1)
-
-            model.Add(ic_self == iop).OnlyEnforceIf(b1)
-            model.Add(ic_self == iq ).OnlyEnforceIf(b2)
-            model.Add(ic_self == 0  ).OnlyEnforceIf(b3)
+        
+        # --- 👇 [핵심 수정] shutdown_current가 없으면 quiescent_current 사용 ---
+        # shutdown_current 값이 유효한지(None이 아니고 0보다 큰지) 확인
+        if ic.shutdown_current is not None and ic.shutdown_current > 0:
+            i_shut = max(0, int(ic.shutdown_current * SCALE))
         else:
-            # 배터리 직결이 아닌 경우: AO면 Iop, 아니면 0
-            model.Add(ic_self == iop).OnlyEnforceIf(ao_ic)
-            model.Add(ic_self == 0  ).OnlyEnforceIf(ao_ic.Not())
+            # 유효하지 않으면 quiescent_current를 대신 사용
+            i_shut = max(0, int(ic.quiescent_current * SCALE))
+        # --- 수정 완료 ---
 
-        # (B) 자식 요구 전류 합산 (AO 자식만, 엣지 선택 시만 반영)
-        children = [c for c in (candidate_ics + loads) if (ic.name, c.name) in edges]
+        ic_self = model.NewIntVar(0, max(iop, i_shut), f"sleep_self_{ic.name}")
+        
+        is_ao = is_always_on_path[ic.name]
+
+        # (A) IC의 3가지 상태(is_ao, use_ishut, no_current) 정의
+        parent_is_ao = model.NewBoolVar(f"parent_of_{ic.name}_is_ao")
+        
+        # 1. parent_is_ao ⇔ OR(edge(p->ic) ∧ is_p_ao) 등가 관계 설정
+        possible_parents = [p for p in parent_nodes if (p.name, ic.name) in edges]
+        z_list = []
+        if possible_parents:
+            for p in possible_parents:
+                is_p_ao = is_always_on_path[p.name]
+                z = bool_and(edges[(p.name, ic.name)], is_p_ao, f"z_{p.name}_{ic.name}")
+                z_list.append(z)
+            
+            model.AddBoolOr([parent_is_ao.Not()] + z_list)
+            for z in z_list:
+                model.AddImplication(z, parent_is_ao)
+        else:
+            model.Add(parent_is_ao == 0)
+
+        # 2. 3가지 상태 변수 정의 및 상호 배타적 관계 설정
+        use_ishut = bool_and(is_ao.Not(), parent_is_ao, f"use_ishut_{ic.name}")
+        no_current = bool_and(is_ao.Not(), parent_is_ao.Not(), f"no_current_{ic.name}")
+        model.AddExactlyOne([is_ao, use_ishut, no_current])
+
+        # (B) 상태에 따른 IC 자체 소모 전류(ic_self) 할당
+        model.Add(ic_self == iop).OnlyEnforceIf(is_ao)
+        model.Add(ic_self == i_shut).OnlyEnforceIf(use_ishut)
+        model.Add(ic_self == 0).OnlyEnforceIf(no_current)
+
+        # ... (이하 로직은 이전과 동일합니다) ...
+
+        # (C) 자식 노드들이 요구하는 전류 합산 (AO 경로 자식만)
+        children = [c for c in all_ic_and_load_nodes if (ic.name, c.name) in edges]
         child_terms = []
         ub_sum = 0
         for c in children:
-            edge_ic_c = edges[(ic.name, c.name)]
-            use_c = bool_and(edge_ic_c, is_always_on_path[c.name], f"use_sleep_{ic.name}__{c.name}")
+            use_c_sleep = bool_and(edges[(ic.name, c.name)], is_always_on_path[c.name], f"use_sleep_{ic.name}__{c.name}")
             ub_c = node_sleep_ub[c.name]
-            term = gate_int_by_bool(node_sleep_in[c.name], ub_c, use_c, f"sleep_term_{ic.name}__{c.name}")
+            term = gate_int_by_bool(node_sleep_in[c.name], ub_c, use_c_sleep, f"sleep_term_{ic.name}__{c.name}")
             child_terms.append(term)
             ub_sum += ub_c
 
         children_out = model.NewIntVar(0, max(0, ub_sum), f"sleep_out_{ic.name}")
         model.Add(children_out == (sum(child_terms) if child_terms else 0))
 
-        # (C) 입력측 변환: LDO=1배, Buck=p/q
+        # (D) 출력 전류를 입력 전류로 변환 (LDO/Buck)
         in_for_children = model.NewIntVar(0, NODE_UB, f"sleep_children_in_{ic.name}")
         if isinstance(ic, LDO):
             model.Add(in_for_children == children_out)
         elif isinstance(ic, BuckConverter):
-            # I_in = I_out * Vout/(Vin*eff_guess)  → q*I_in = p*I_out
-            # Vin 후보가 고정 인스턴스(12V or 하위 레벨)로 들어온다는 전제
-
-            # 보수적 슬립 효율 추정
-            eff_sleep = getattr(ic,'eff_sleep',None)
-            if not eff_sleep or eff_sleep <=0:
-                eff_sleep = constraints.get('sleep_efficiency_guess',0.35)
-            # 너무 과격/후한 값을 방지하기 위한 안전 범위
-            eff_sleep = max(0.05,min(eff_sleep,0.85))
-
-            # 1) ic.vin 있으면 그걸 쓰고, 없으면 배터리의 최저전압을 씀
-            vin_ref = getattr(ic, 'vin', 0.0) or battery.voltage_min
-            # 2) 최종적으로 '가능한 가장 낮은' Vin을 선택 (보수적)
-            vin_ref = min(vin_ref, battery.voltage_min)
-            # 3) 분모에 들어갈 V_in * η (효율) 계산. 0으로 나눔 방지용 최소치 포함
+            eff_sleep = constraints.get('sleep_efficiency_guess', 0.35)
+            eff_sleep = max(0.05, min(eff_sleep, 0.85))
+            vin_ref = ic.vin if ic.vin > 0 else battery.voltage_min
             vin_eff = max(1e-6, vin_ref * eff_sleep)
-
-            vout = max(0.0, ic.vout)
-            p = max(1, int(round(vout    * 1000)))   # 정수화
+            p = max(1, int(round(ic.vout * 1000)))
             q = max(1, int(round(vin_eff * 1000)))
             model.Add(in_for_children * q == children_out * p)
         else:
-            model.Add(in_for_children == children_out)  # 안전 기본값
+            model.Add(in_for_children == 0)
 
-        # (D) 총 입력 = 자기소모 + 자식 공급을 위한 입력
-        total_in = model.NewIntVar(0, NODE_UB, f"sleep_total_in_{ic.name}")
-        model.Add(total_in == ic_self + in_for_children)
-        model.Add(node_sleep_in[ic.name] == total_in)
+        # (E) IC의 총 입력 전류 = 자체 소모 + 자식 공급용
+        model.Add(node_sleep_in[ic.name] == ic_self + in_for_children)
 
-    # (E) 배터리 관점 슬립전류: 배터리 직결 노드만 합산
-    top_children = [c for c in (candidate_ics + loads) if (battery.name, c.name) in edges]
+    # --- 최종 제약 조건: 배터리 관점 (이전과 동일) ---
+    top_children = [c for c in all_ic_and_load_nodes if (battery.name, c.name) in edges]
     final_terms = []
     for c in top_children:
-        edge_batt_c = edges[(battery.name, c.name)]
-        if isinstance(c, Load):
-            # 안전하게 AO도 함께 게이팅 (실제로는 load 변수 내부에서 0/const로 처리됨)
-            use_top = bool_and(edge_batt_c, is_always_on_path[c.name], f"top_use_{c.name}")
-            const_val = node_sleep_ub[c.name]
-            final_terms.append(gate_const_by_bool(const_val, use_top, f"top_term_{c.name}"))
-        else:
-            final_terms.append(gate_int_by_bool(node_sleep_in[c.name], node_sleep_ub[c.name], edge_batt_c, f"top_term_{c.name}"))
+        term = gate_int_by_bool(node_sleep_in[c.name], node_sleep_ub[c.name], edges[(battery.name, c.name)], f"top_term_{c.name}")
+        final_terms.append(term)
 
     model.Add(sum(final_terms) <= int(max_sleep * SCALE))
 
 # 💡 원본의 병렬해 탐색 함수 수정
 def find_all_load_distributions(base_solution, candidate_ics, loads, battery, constraints, viz_func, check_func):
     """
-    대표 해를 기반으로, 부하를 재분배하여 가능한 모든 유효한 병렬해를 탐색합니다.
-    config.json의 설정에 따라 실행 여부와 최대 탐색 개수가 제어됩니다.
+    (최종 개선 로직) 대표 해를 기반으로, exclusive_path와 exclusive_supplier 제약조건을
+    위반하지 않으면서 부하를 재분배하여 가능한 모든 유효한 병렬해를 탐색합니다.
     """
-    # 설정 가져오기 (없으면 기본값 사용)
     search_settings = constraints.get('parallel_search_settings', {})
     if not search_settings.get('enabled', False):
         print("\n👑 --- 병렬 해 탐색 비활성화됨 --- 👑")
-        # 비활성화 시, 대표 해만 검증하고 시각화
         if check_func(base_solution, candidate_ics, loads, battery, constraints):
             viz_func(base_solution, candidate_ics, loads, battery, constraints, solution_index=1)
         return
 
     print("\n\n👑 --- 최종 단계: 모든 부하 분배 조합 탐색 --- 👑")
-    max_solutions = search_settings.get('max_solutions_to_generate', 500) # 최대 탐색 개수 제한
+    max_solutions = search_settings.get('max_solutions_to_generate', 500)
 
     candidate_ics_map = {ic.name: ic for ic in candidate_ics}
+    child_to_parent = {c: p for p, c in base_solution['active_edges']}
+    parent_to_children = defaultdict(list)
+    for p, c in base_solution['active_edges']:
+        parent_to_children[p].append(c)
+
+    # --- 👇 [핵심 수정] Exclusive Path와 Supplier에 속한 IC와 부하 모두 식별 ---
+    exclusive_ics = set()
+    exclusive_loads = set()
+    for load in loads:
+        if load.independent_rail_type == 'exclusive_path':
+            current_node_name = load.name
+            exclusive_loads.add(current_node_name)
+            # 전체 경로를 추적
+            while current_node_name in child_to_parent:
+                parent_name = child_to_parent[current_node_name]
+                if parent_name == battery.name:
+                    break
+                exclusive_ics.add(parent_name)
+                current_node_name = parent_name
+        elif load.independent_rail_type == 'exclusive_supplier':
+            # 부하와 직계 부모 IC만 식별
+            parent_name = child_to_parent.get(load.name)
+            if parent_name and parent_name in candidate_ics_map:
+                exclusive_loads.add(load.name)
+                exclusive_ics.add(parent_name)
+    # --- 수정 완료 ---
+
     ic_type_to_instances = defaultdict(list)
     for ic_name in base_solution['used_ic_names']:
         ic = candidate_ics_map.get(ic_name)
-        if ic:
+        # Exclusive 제약에 걸린 IC는 재분배 그룹에서 제외
+        if ic and ic.name not in exclusive_ics:
             ic_type = f"📦 {ic.name.split('@')[0]} ({ic.vout:.1f}Vout)"
             ic_type_to_instances[ic_type].append(ic)
 
-    instance_to_children = defaultdict(set)
-    for p, c in base_solution['active_edges']:
-        if p in candidate_ics_map:
-            instance_to_children[p].add(c)
-    
     target_group = None
     for ic_type, instances in ic_type_to_instances.items():
         if len(instances) > 1:
             total_load_pool = set()
             for inst in instances:
-                total_load_pool.update(instance_to_children[inst.name])
+                # Exclusive 부하가 아닌 일반 부하만 재분배 대상에 추가
+                loads_for_inst = [c for c in parent_to_children.get(inst.name, []) if c not in exclusive_loads]
+                total_load_pool.update(loads_for_inst)
+
             if total_load_pool:
                 target_group = {
                     'instances': [inst.name for inst in instances],
@@ -579,6 +586,7 @@ def find_all_load_distributions(base_solution, candidate_ics, loads, battery, co
 
     if not target_group:
         print("\n -> 이 해답에는 생성할 병렬해가 없습니다.")
+        # 대표해는 여전히 유효하므로 검증하고 시각화
         if check_func(base_solution, candidate_ics, loads, battery, constraints):
             viz_func(base_solution, candidate_ics, loads, battery, constraints, solution_index=1)
         return
@@ -586,37 +594,51 @@ def find_all_load_distributions(base_solution, candidate_ics, loads, battery, co
     def find_partitions(items, num_bins):
         if not items:
             yield [[] for _ in range(num_bins)]
-        else:
-            for partition in find_partitions(items[1:], num_bins):
-                for i in range(num_bins):
-                    yield partition[:i] + [[items[0]] + partition[i]] + partition[i+1:]
-                if num_bins > len(partition):
-                    yield partition + [[items[0]]]
-
+            return
+        first = items[0]
+        rest = items[1:]
+        for p in find_partitions(rest, num_bins):
+            for i in range(num_bins):
+                yield p[:i] + [[first] + p[i]] + p[i+1:]
+    
     valid_solutions = []
     seen_partitions = set()
     num_instances = len(target_group['instances'])
     load_pool = target_group['load_pool']
     solution_count = 0
 
+    # 고정된 엣지 (Exclusive 엣지 및 재분배와 관련 없는 모든 엣지)
+    fixed_edges = [edge for edge in base_solution['active_edges'] if edge[0] not in target_group['instances']]
+
     for p in find_partitions(load_pool, num_instances):
         if solution_count >= max_solutions:
             print(f"\n⚠️ 경고: 병렬 해 조합이 너무 많아 {max_solutions}개에서 탐색을 중단합니다.")
             break
-            
-        if len(p) == num_instances:
-            canonical_partition = tuple(sorted([tuple(sorted(sublist)) for sublist in p]))
-            if canonical_partition in seen_partitions:
-                continue
-            seen_partitions.add(canonical_partition)
-            new_edges = [edge for edge in base_solution['active_edges'] if edge[0] not in target_group['instances']]
-            for i, instance_name in enumerate(target_group['instances']):
-                for load_name in p[i]:
-                    new_edges.append((instance_name, load_name))
-            new_solution = {"used_ic_names": base_solution['used_ic_names'], "active_edges": new_edges, "cost": base_solution['cost']}
-            if check_func(new_solution, candidate_ics, loads, battery, constraints):
-                valid_solutions.append(new_solution)
+        
+        if len(p) != num_instances:
+            continue
+
+        canonical_partition = tuple(sorted([tuple(sorted(sublist)) for sublist in p]))
+        if canonical_partition in seen_partitions:
+            continue
+        seen_partitions.add(canonical_partition)
+        
+        new_edges = list(fixed_edges)
+        for i, instance_name in enumerate(target_group['instances']):
+            for load_name in p[i]:
+                new_edges.append((instance_name, load_name))
+        
+        new_solution = {"used_ic_names": base_solution['used_ic_names'], "active_edges": new_edges, "cost": base_solution['cost']}
+        
+        if check_func(new_solution, candidate_ics, loads, battery, constraints):
+            valid_solutions.append(new_solution)
         solution_count += 1
+    
+    if not valid_solutions and check_func(base_solution, candidate_ics, loads, battery, constraints):
+        # 만약 재분배 후 유효한 해가 하나도 없으면, 원본 대표해라도 결과에 포함
+        print("\n -> 생성된 병렬해가 모두 유효하지 않아, 원본 대표해를 사용합니다.")
+        valid_solutions.append(base_solution)
+
     print(f"\n✅ 총 {len(valid_solutions)}개의 유효한 병렬해 구조를 찾았습니다.")
     for i, solution in enumerate(valid_solutions):
         print(f"\n--- [병렬해 #{i+1}] ---")
