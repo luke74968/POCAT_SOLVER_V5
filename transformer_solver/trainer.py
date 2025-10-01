@@ -9,7 +9,7 @@ from collections import defaultdict # 👈 이 줄을 추가해주세요.
 import json
 import logging
 
-from common.utils.common import TimeEstimator, clip_grad_norms, unbatchify
+from common.utils.common import TimeEstimator, clip_grad_norms, unbatchify, batchify
 from .model import PocatModel
 from .pocat_env import PocatEnv
 from common.pocat_visualizer import print_and_visualize_one_solution
@@ -54,6 +54,8 @@ class PocatTrainer:
         
         # 💡 3. 모델을 생성 후, 지정된 device로 이동
         self.model = PocatModel(**args.model_params).to(self.device)
+        #self.model = torch.compile(self.model)
+
         cal_model_size(self.model, args.log)
         
         # 💡 float()으로 감싸서 값을 숫자로 강제 변환합니다.
@@ -125,6 +127,12 @@ class PocatTrainer:
                 td = self.env.reset(batch_size=args.batch_size)
                 reset_time = time.time() - reset_start_time
                 
+                # --- 👇 [핵심 수정 1] 학습 시 데이터 확장 ---
+                if args.num_pomo_samples > 1:
+                    td = batchify(td, args.num_pomo_samples)
+                # --- 수정 완료 ---
+
+
                 model_start_time = time.time()
                 # --- 👇 [핵심] log 함수를 모델에 전달 ---
                 out = self.model(td, self.env, decode_type='sampling', pbar=train_pbar,
@@ -134,8 +142,8 @@ class PocatTrainer:
                 
                 bwd_start_time = time.time()
                 num_starts = self.env.generator.num_loads
-                reward = out["reward"].view(num_starts, -1)
-                log_likelihood = out["log_likelihood"].view(num_starts, -1)
+                reward = out["reward"].view(-1, num_starts)
+                log_likelihood = out["log_likelihood"].view(-1, num_starts)
                 
                 advantage = reward - reward.mean(dim=0, keepdims=True)
                 loss = -(advantage * log_likelihood).mean()
@@ -160,11 +168,17 @@ class PocatTrainer:
                     bwd_time * 1000,
                 )
 
-                best_reward_per_instance = reward.max(dim=0)[0]
+                # 각 샘플 실행에서 찾은 최상의 보상을 가져옴
+                best_reward_per_sample_run = reward.max(dim=1)[0]
+                # 원본 배치 인스턴스별로 결과를 재구성
+                best_reward_per_sample_run = best_reward_per_sample_run.view(args.batch_size, args.num_pomo_samples)
+                # 각 인스턴스에 대해 샘플들 간의 평균 최상위 보상을 계산
+                avg_of_bests = best_reward_per_sample_run.mean(dim=1)
+
                 
                 # 💡 **[변경 2]** 현재 배치의 평균 비용과 최소 비용 계산
-                avg_cost = -best_reward_per_instance.mean().item()
-                min_batch_cost = -best_reward_per_instance.max().item()
+                avg_cost = -avg_of_bests.mean().item()
+                min_batch_cost = -avg_of_bests.max().item()
                 min_epoch_cost = min(min_epoch_cost, min_batch_cost)
 
 
@@ -214,6 +228,11 @@ class PocatTrainer:
     def evaluate(self, epoch: int):
         """Greedy decode on a fixed validation set, CSV log, and save best checkpoint by avg BOM."""
         self.model.eval()
+        # --- 👇 [핵심 수정 4] 평가 시 데이터 확장 ---
+        eval_samples = self.args.test_num_pomo_samples
+        td_eval = self._eval_td_fixed.clone()
+        if eval_samples > 1:
+            td_eval = batchify(td_eval, eval_samples)
 
         # Rebuild eval TD from the fixed snapshot (same instances every epoch)
         td_eval = self.env._reset(self._eval_td_fixed.clone())
@@ -257,16 +276,20 @@ class PocatTrainer:
 
     def test(self):
         self.model.eval()
-        logging.info("==================== INFERENCE START ====================")
+        # 💡 이전에는 logging.info 였으나, args.log를 사용하도록 통일합니다.
+        self.args.log("==================== INFERENCE START ====================")
 
         td = self.env.reset(batch_size=1)
         
         # --- 👇 [핵심 수정 1] POMO 시작 노드 정보 가져오기 ---
         _, start_nodes_idx = self.env.select_start_nodes(td)
         
-        pbar = tqdm(total=1, desc=f"Solving Power Tree (Mode: {self.args.decode_type})")
+        # 💡 test_num_pomo_samples 인자를 사용하도록 수정
+        pbar_desc = f"Solving Power Tree (Mode: {self.args.decode_type}, Samples: {self.args.test_num_pomo_samples})"
+        pbar = tqdm(total=1, desc=pbar_desc)
+        
         out = self.model(td, self.env, decode_type=self.args.decode_type, pbar=pbar, 
-                         log_fn=logging.info, log_idx=self.args.log_idx, 
+                         log_fn=self.args.log, log_idx=self.args.log_idx, 
                          log_mode=self.args.log_mode)
         pbar.close()
 
@@ -280,11 +303,17 @@ class PocatTrainer:
         # --- 👇 [핵심 수정 2] 최적해의 시작 노드 이름 찾기 및 출력 ---
         best_start_node_idx = start_nodes_idx[best_idx].item()
         best_start_node_name = self.env.generator.config.node_names[best_start_node_idx]
-        print(f"Generated Power Tree (Best start: '{best_start_node_name}'), Cost: ${final_cost:.4f}")
+        # 💡 POMO 샘플 수를 함께 출력하도록 개선
+        self.args.log(f"Generated Power Tree (Best of {len(start_nodes_idx)} samples, start: '{best_start_node_name}'), Cost: ${final_cost:.4f}")
 
         action_history = []
-        td_sim = self.env._reset(td.clone())
+        
+        # --- 👇 [핵심 수정 3] 시뮬레이션을 위해 batch_size=1로 환경을 새로 리셋합니다. ---
+        # 기존 코드: td_sim = self.env._reset(td.clone()) # <- 오류 발생 지점
+        td_sim = self.env.reset(batch_size=1) # <--- 이렇게 수정해주세요!
+        # --- 수정 완료 ---
 
+        # 이제 td_sim의 batch_size가 1이므로 오류가 발생하지 않습니다.
         td_sim.set("action", best_action_sequence[0])
         output_td = self.env.step(td_sim)
         td_sim = output_td["next"]
@@ -299,8 +328,9 @@ class PocatTrainer:
             output_td = self.env.step(td_sim)
             td_sim = output_td["next"]
 
-        # --- 👇 [핵심 수정 3] 시각화 함수에 시작 노드 이름 전달 ---
+        # --- 👇 [핵심 수정 4] 시각화 함수에 시작 노드 이름 전달 ---
         self.visualize_result(action_history, final_cost, best_start_node_name, td_sim)
+
 
 
 # transformer_solver/trainer.py -> PocatTrainer 클래스 내부에 붙여넣기

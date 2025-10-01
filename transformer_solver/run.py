@@ -9,6 +9,10 @@ import torch
 import logging
 import argparse
 
+if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8:
+    torch.set_float32_matmul_precision('high')
+
+
 from .trainer import PocatTrainer
 from .pocat_env import PocatEnv
 
@@ -50,7 +54,12 @@ if __name__ == "__main__":
     parser.add_argument("--config_file", type=str, default="config.json", help="Path to POCAT config file")
     parser.add_argument("--config_yaml", type=str, default="config.yaml", help="Path to model/training config YAML")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed")
-    
+    # --- 👇 [수정] POMO 샘플링 횟수 인자 추가 ---
+    parser.add_argument("--num_pomo_samples", type=int, default=8, 
+                        help="Number of POMO samples to run during training.")
+    parser.add_argument("--test_num_pomo_samples", type=int, default=8, 
+                        help="Number of POMO samples for testing/evaluation. Defaults to num_pomo_samples if not set.")
+
     # 💡 추론을 위한 인자 추가
     parser.add_argument('--test_only', action='store_true', help="Only run test/inference")
     parser.add_argument('--load_path', type=str, default=None, help="Path to a saved model checkpoint (.pth)")
@@ -64,6 +73,10 @@ if __name__ == "__main__":
                         help="Decoding strategy for test mode: 'greedy' or 'sampling'.")
 
     args = parser.parse_args()
+
+    if args.test_num_pomo_samples is None:
+     args.test_num_pomo_samples = args.num_pomo_samples
+
     
     args.start_time = time.strftime("%Y-%m%d-%H%M%S", time.localtime())
     args.result_dir = os.path.join('result', args.start_time)
