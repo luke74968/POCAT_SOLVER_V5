@@ -54,8 +54,6 @@ class PocatTrainer:
         
         # 💡 3. 모델을 생성 후, 지정된 device로 이동
         self.model = PocatModel(**args.model_params).to(self.device)
-        #self.model = torch.compile(self.model)
-
         cal_model_size(self.model, args.log)
         
         # 💡 float()으로 감싸서 값을 숫자로 강제 변환합니다.
@@ -276,44 +274,40 @@ class PocatTrainer:
 
     def test(self):
         self.model.eval()
-        # 💡 이전에는 logging.info 였으나, args.log를 사용하도록 통일합니다.
-        self.args.log("==================== INFERENCE START ====================")
+        logging.info("==================== INFERENCE START ====================")
 
+        # --- 👇 [핵심 수정 5] 테스트 시 데이터 확장 및 결과 처리 ---
+        test_samples = self.args.test_num_pomo_samples
         td = self.env.reset(batch_size=1)
+        if test_samples > 1:
+            td = batchify(td, test_samples)
         
-        # --- 👇 [핵심 수정 1] POMO 시작 노드 정보 가져오기 ---
-        _, start_nodes_idx = self.env.select_start_nodes(td)
-        
-        # 💡 test_num_pomo_samples 인자를 사용하도록 수정
-        pbar_desc = f"Solving Power Tree (Mode: {self.args.decode_type}, Samples: {self.args.test_num_pomo_samples})"
-        pbar = tqdm(total=1, desc=pbar_desc)
-        
+        pbar = tqdm(total=1, desc=f"Solving Power Tree (Mode: {self.args.decode_type}, Samples: {test_samples})")
         out = self.model(td, self.env, decode_type=self.args.decode_type, pbar=pbar, 
-                         log_fn=self.args.log, log_idx=self.args.log_idx, 
+                         log_fn=logging.info, log_idx=self.args.log_idx, 
                          log_mode=self.args.log_mode)
         pbar.close()
 
         reward = out['reward']
         actions = out['actions']
         
+        # 모든 샘플과 시작 노드 중에서 단 하나의 최고 결과를 선택
         best_idx = reward.argmax()
         final_cost = -reward[best_idx].item()
         best_action_sequence = actions[best_idx]
 
-        # --- 👇 [핵심 수정 2] 최적해의 시작 노드 이름 찾기 및 출력 ---
-        best_start_node_idx = start_nodes_idx[best_idx].item()
+        # 최적해의 시작 노드 정보를 정확히 찾기
+        num_starts = self.env.generator.num_loads
+        _, start_nodes_idx = self.env.select_start_nodes(self.env.reset(batch_size=1))
+        
+        best_start_node_local_idx = best_idx % num_starts
+        best_start_node_idx = start_nodes_idx[best_start_node_local_idx].item()
         best_start_node_name = self.env.generator.config.node_names[best_start_node_idx]
-        # 💡 POMO 샘플 수를 함께 출력하도록 개선
-        self.args.log(f"Generated Power Tree (Best of {len(start_nodes_idx)} samples, start: '{best_start_node_name}'), Cost: ${final_cost:.4f}")
+        print(f"Generated Power Tree (Best of {test_samples} samples, start: '{best_start_node_name}'), Cost: ${final_cost:.4f}")
 
         action_history = []
-        
-        # --- 👇 [핵심 수정 3] 시뮬레이션을 위해 batch_size=1로 환경을 새로 리셋합니다. ---
-        # 기존 코드: td_sim = self.env._reset(td.clone()) # <- 오류 발생 지점
-        td_sim = self.env.reset(batch_size=1) # <--- 이렇게 수정해주세요!
-        # --- 수정 완료 ---
+        td_sim = self.env._reset(td.clone())
 
-        # 이제 td_sim의 batch_size가 1이므로 오류가 발생하지 않습니다.
         td_sim.set("action", best_action_sequence[0])
         output_td = self.env.step(td_sim)
         td_sim = output_td["next"]
@@ -328,9 +322,8 @@ class PocatTrainer:
             output_td = self.env.step(td_sim)
             td_sim = output_td["next"]
 
-        # --- 👇 [핵심 수정 4] 시각화 함수에 시작 노드 이름 전달 ---
+        # --- 👇 [핵심 수정 3] 시각화 함수에 시작 노드 이름 전달 ---
         self.visualize_result(action_history, final_cost, best_start_node_name, td_sim)
-
 
 
 # transformer_solver/trainer.py -> PocatTrainer 클래스 내부에 붙여넣기

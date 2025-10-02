@@ -9,6 +9,9 @@ from common.pocat_classes import Battery, Load, PowerIC, LDO, BuckConverter
 # 순환 참조를 피하기 위해 함수를 직접 임포트하지 않고, main에서 넘겨받도록 구조 변경
 # from pocat_visualizer import check_solution_validity, print_and_visualize_one_solution
 
+SCALE = 1_000_000_000
+
+
 # 솔버 콜백 클래스
 class SolutionCollector(cp_model.CpSolverSolutionCallback):
     def __init__(self, ic_is_used, edges):
@@ -190,7 +193,6 @@ def add_ic_group_constraints(model, ic_groups, ic_is_used):
 
 def add_current_limit_constraints(model, candidate_ics, loads, constraints, edges):
     """IC의 전류 한계(열 마진, 전기 마진) 제약 조건을 추가합니다."""
-    SCALE = 1_000_000
     all_ic_and_load_nodes = candidate_ics + loads
     
     child_current_draw = {node.name: int(node.current_active * SCALE) for node in loads}
@@ -384,7 +386,6 @@ def add_sleep_current_constraints(model, battery, candidate_ics, loads, constrai
         3. no_current: 비-AO 경로이고, 부모도 비-AO라서 전류 소모 없음
     - 위 세 상태는 상호 배타적이며, 반드시 하나는 참이 되도록 제약합니다.
     """
-    SCALE = 1_000_000
     max_sleep = constraints.get('max_sleep_current', 0.0)
     if max_sleep <= 0:
         return

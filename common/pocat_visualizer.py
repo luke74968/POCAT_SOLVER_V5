@@ -226,7 +226,7 @@ def print_and_visualize_one_solution(solution, candidate_ics, loads, battery, co
                         i_in_sleep = total_i_out_sleep + ic_self_sleep
                     elif isinstance(ic, BuckConverter):
                         if ic.vin > 0:
-                            eff_sleep = constraints.get('sleep_efficiency_guess', 0.8)
+                            eff_sleep = constraints.get('sleep_efficiency_guess', 0.35)
                             p_out_sleep = ic.vout * total_i_out_sleep
                             p_in_sleep = p_out_sleep / eff_sleep if p_out_sleep > 0 else 0
                             i_in_sleep = (p_in_sleep / ic.vin) + ic_self_sleep
