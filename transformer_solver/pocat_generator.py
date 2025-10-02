@@ -192,6 +192,9 @@ class PocatGenerator:
             features[idx, FEATURE_INDEX["i_limit"]] = ic_conf.get("i_limit", 0.0)
             features[idx, FEATURE_INDEX["theta_ja"]] = ic_conf.get("theta_ja", 999.0)
             features[idx, FEATURE_INDEX["t_junction_max"]] = ic_conf.get("t_junction_max", 125.0)
+            # 💡 [수정] quiescent_current와 shutdown_current 값을 텐서에 추가
+            features[idx, FEATURE_INDEX["quiescent_current"]] = ic_conf.get("quiescent_current", 0.0)
+            features[idx, FEATURE_INDEX["shutdown_current"]] = ic_conf.get("shutdown_current", 0.0)
 
             ic_type = ic_conf.get("type")
             if ic_type == 'LDO':

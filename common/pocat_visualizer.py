@@ -99,13 +99,36 @@ def visualize_tree(solution, candidate_ics, loads, battery, constraints, junctio
     margin_info = f"Current Margin: {constraints.get('current_margin', 0)*100:.0f}%"
     temp_info = f"Ambient Temp: {constraints.get('ambient_temperature', 25)}°C"
     dot.attr(rankdir='LR', label=f"{margin_info}\n{temp_info}\n\nSolution Cost: ${solution['cost']:.2f}", labelloc='t', fontname='Arial')
-    
+
+    max_sleep_current_target = constraints.get('max_sleep_current', 0.0)
     battery_label = (f"🔋 {battery.name}\n\n"
         f"Total Active Power: {total_active_power:.2f} W\n"
         f"Total Active Current: {total_active_current * 1000:.1f} mA\n"
+        f"Target Sleep Current: <= {max_sleep_current_target * 1000000:,.1f} µA\n"
         f"Total Sleep Current: {total_sleep_current * 1000000:,.1f} µA")
+
     dot.node(battery.name, battery_label, shape='Mdiamond', color='darkgreen', fillcolor='white')
-    
+    # --- 💡 [수정] 독립 조건 노드 추적 ---
+    child_to_parent = {c: p for p, c in solution['active_edges']}
+    supplier_nodes = set()
+    path_nodes = set()
+
+    for load in loads:
+        rail_type = load.independent_rail_type
+        if rail_type == 'exclusive_supplier':
+            supplier_nodes.add(load.name)
+            if load.name in child_to_parent:
+                supplier_nodes.add(child_to_parent[load.name])
+        elif rail_type == 'exclusive_path':
+            current_node = load.name
+            while current_node in child_to_parent:
+                path_nodes.add(current_node)
+                parent = child_to_parent[current_node]
+                path_nodes.add(parent)
+                if parent == battery.name: break
+                current_node = parent
+    # --- 수정 완료 ---
+
     used_ics_map = {ic.name: ic for ic in candidate_ics if ic.name in solution['used_ic_names']}
     for ic_name, ic in used_ics_map.items():
         calculated_tj = junction_temps.get(ic_name, 0)
@@ -116,9 +139,19 @@ def visualize_tree(solution, candidate_ics, loads, battery, constraints, junctio
         i_self_sleep = ic_self_consumption_sleep.get(ic_name, 0)
         
         thermal_margin = ic.t_junction_max - calculated_tj
-        
+        # --- 💡 [수정] 노드 스타일링 로직 ---
+        node_style = 'rounded,filled'
+        if ic_name not in always_on_nodes:
+            node_style += ',dashed'
+
+        fill_color = 'white'
+        if ic_name in path_nodes:
+            fill_color = 'lightblue'
+        elif ic_name in supplier_nodes:
+            fill_color = 'lightyellow'
+        # --- 수정 완료 ---
+
         node_color = 'blue'
-        fill_color = 'white' if ic_name in always_on_nodes else 'lightgrey'
         if thermal_margin < 10: node_color = 'red'
         elif thermal_margin < 25: node_color = 'orange'
         
@@ -131,7 +164,7 @@ def visualize_tree(solution, candidate_ics, loads, battery, constraints, junctio
             f"Tj: {calculated_tj:.1f}°C (Max: {ic.t_junction_max}°C)\n"
             f"Cost: ${ic.cost:.2f}")
         # --- 수정 완료 ---
-        dot.node(ic_name, label, color=node_color, fillcolor=fill_color, penwidth='3')
+        dot.node(ic_name, label, color=node_color, fillcolor=fill_color, style=node_style, penwidth='3')
 
     sequenced_loads = set()
     if 'power_sequences' in constraints:
@@ -139,7 +172,18 @@ def visualize_tree(solution, candidate_ics, loads, battery, constraints, junctio
             sequenced_loads.add(seq['j']); sequenced_loads.add(seq['k'])
             
     for load in loads:
-        fill_color = 'white' if load.name in always_on_nodes else 'lightgrey'
+                # --- 💡 [수정] 부하 노드 스타일링 로직 ---
+        node_style = 'rounded,filled'
+        if load.name not in always_on_nodes:
+            node_style += ',dashed'
+
+        fill_color = 'white'
+        if load.name in path_nodes:
+            fill_color = 'lightblue'
+        elif load.name in supplier_nodes:
+            fill_color = 'lightyellow'
+
+        # --- 수정 완료 ---
         label = f"💡 {load.name}\nActive: {load.voltage_typical}V | {load.current_active*1000:.1f}mA\n"
         if load.current_sleep > 0: label += f"Sleep: {load.current_sleep * 1000000:,.1f}µA\n"
         
@@ -153,7 +197,7 @@ def visualize_tree(solution, candidate_ics, loads, battery, constraints, junctio
             
         penwidth = '1'
         if load.always_on_in_sleep: penwidth = '3'
-        dot.node(load.name, label, color='dimgray', fillcolor=fill_color, penwidth=penwidth)
+        dot.node(load.name, label, color='dimgray', fillcolor=fill_color, style=node_style, penwidth=penwidth)
         
     for p_name, c_name in solution['active_edges']:
         dot.edge(p_name, c_name)

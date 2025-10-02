@@ -2,6 +2,7 @@
 
 import json
 import sys
+import argparse  # 💡 argparse 모듈 추가
 from dataclasses import asdict
 from ortools.sat.python import cp_model
 
@@ -24,6 +25,11 @@ def main():
         print("오류: 설정 파일(.json)을 명령행 인자로 전달해야 합니다.")
         print("사용법: python main.py <config_filename.json>")
         return
+
+    parser = argparse.ArgumentParser(description="Pocat OR-Tools Solver")
+    parser.add_argument("config_filename", type=str, help="Path to the configuration file (.json)")
+    parser.add_argument("--max_sleep_current", type=float, default=None, help="Override the max_sleep_current constraint (in Amperes).")
+    args = parser.parse_args()
     
     config_filename = sys.argv[1]
     print(f"📖 설정 파일 '{config_filename}' 로딩...")
@@ -35,7 +41,12 @@ def main():
     except FileNotFoundError:
         print(f"오류: 설정 파일 '{config_filename}'을(를) 찾을 수 없습니다.")
         return
-        
+
+    if args.max_sleep_current is not None:
+        original_value = constraints.get('max_sleep_current', 'N/A')
+        print(f"⚡ 암전류 제약조건 변경: {original_value} -> {args.max_sleep_current} A")
+        constraints['max_sleep_current'] = args.max_sleep_current
+
    
     # 2. 후보 IC 생성
     candidate_ics, ic_groups = expand_ic_instances(available_ics, loads, battery, constraints)

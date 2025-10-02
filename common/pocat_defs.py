@@ -25,10 +25,13 @@ FEATURE_INDEX = {
     "theta_ja": 17,             # (신규) 열저항 (정적)
     "t_junction_max": 18,       # (신규) 최대 허용 정션 온도 (정적)
     "junction_temp": 19,        # (신규) 현재 정션 온도 (동적)
+    "quiescent_current": 20,    # (추가) 대기 전류 (정적)
+    "shutdown_current": 21,     # (추가) 차단 전류 (정적)
+
 }
 
 # 전체 피처 차원
-FEATURE_DIM = 20
+FEATURE_DIM = 22
 # 💡 수정: 기존 PROMPT_FEATURE_DIM을 SCALAR_PROMPT_FEATURE_DIM으로 변경
 SCALAR_PROMPT_FEATURE_DIM = 4
 

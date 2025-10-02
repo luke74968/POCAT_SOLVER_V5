@@ -18,7 +18,7 @@ source .venv/bin/activate
 
 # 3. Code 실행
 # OR-TOOLS Solver 실행
-python -m or_tools_solver.main config.json
+python -m or_tools_solver.main config.json --max_sleep_current 0.01
 # Tronsformer based solver 학습 실행
 python -m transformer_solver.run --config_file config_4.json --config_yaml config.yaml --batch_size 1 --log_idx 8 --log_mode detail --decode_type sampling
 python -m transformer_solver.run --config_file config_4.json --config_yaml config.yaml --batch_size 256 --log_idx 8 --log_mode progress  --decode_type sampling     

@@ -1,21 +1,21 @@
 {
   "battery": {
-    "name": "Li-Ion_4S_HighCap",
+    "name": "Battery",
     "voltage_min": 12.0,
     "voltage_max": 16.8,
     "capacity_mah": 10000
   },
   "available_ics": [
-    { "type": "LDO", "name": "MAX25300B", "vin_min": 1.7, "vin_max": 5.5, "vout_min": 0.6, "vout_max": 5.3, "i_limit": 0.5, "v_dropout": 0.3, "operating_current": 0.0006, "quiescent_current": 0.0006, "shutdown_current":0.0000001, "cost": 0.61, "theta_ja": 102.0, "t_junction_max": 125 },
-    { "type": "LDO", "name": "LT3065 ", "vin_min": 1.6, "vin_max": 45.0, "vout_min": 0.6, "vout_max": 40, "i_limit": 0.5, "v_dropout": 0.51, "operating_current": 0.025, "quiescent_current": 0.00011, "shutdown_current":0.000001, "cost": 2.25, "theta_ja": 35.0, "t_junction_max": 125 },
-    { "type": "LDO", "name": "LT3060", "vin_min": 1.6, "vin_max": 45.0, "vout_min": 0.6, "vout_max": 44.5, "i_limit": 0.1, "v_dropout": 0.51, "operating_current": 0.004, "quiescent_current": 0.00008, "shutdown_current":0.000001, "cost": 1.49, "theta_ja": 67.0, "t_junction_max": 125 },
+    { "type": "LDO", "name": "LDO_A_Low_Vin", "vin_min": 1.7, "vin_max": 5.5, "vout_min": 0.6, "vout_max": 5.3, "i_limit": 0.5, "v_dropout": 0.3, "operating_current": 0.0006, "quiescent_current": 0.0006, "shutdown_current":0.0000001, "cost": 0.61, "theta_ja": 102.0, "t_junction_max": 125 },
+    { "type": "LDO", "name": "LDO_B_Wide_Vin_High_Iout", "vin_min": 1.6, "vin_max": 45.0, "vout_min": 0.6, "vout_max": 40, "i_limit": 0.5, "v_dropout": 0.51, "operating_current": 0.025, "quiescent_current": 0.00011, "shutdown_current":0.000001, "cost": 2.25, "theta_ja": 35.0, "t_junction_max": 125 },
+    { "type": "LDO", "name": "LDO_C_Wide_Vin_Low_Iout", "vin_min": 1.6, "vin_max": 45.0, "vout_min": 0.6, "vout_max": 44.5, "i_limit": 0.1, "v_dropout": 0.51, "operating_current": 0.004, "quiescent_current": 0.00008, "shutdown_current":0.000001, "cost": 1.49, "theta_ja": 67.0, "t_junction_max": 125 },
 
     
-    { "type": "Buck", "name": "MAX20402", "vin_min": 3.0, "vin_max": 36, "vout_min": 0.8, "vout_max": 14, "i_limit": 2.5, "operating_current": 0.00005, "quiescent_current": 0.00001, "shutdown_current":0.000005, "cost": 2.07, "theta_ja": 51.1, "t_junction_max": 125 },
-    { "type": "Buck", "name": "MAX20403", "vin_min": 3.0, "vin_max": 36, "vout_min": 0.8, "vout_max": 14, "i_limit": 3.5, "operating_current": 0.00005, "quiescent_current": 0.00001, "shutdown_current":0.000005,"cost": 2.17, "theta_ja": 51.1, "t_junction_max": 125 },
+    { "type": "Buck", "name": "Buck_A_Wide_Vin", "vin_min": 3.0, "vin_max": 36, "vout_min": 0.8, "vout_max": 14, "i_limit": 2.5, "operating_current": 0.00005, "quiescent_current": 0.00001, "shutdown_current":0.000005, "cost": 2.07, "theta_ja": 51.1, "t_junction_max": 125 },
+    { "type": "Buck", "name": "Buck_B_Wide_Vin", "vin_min": 3.0, "vin_max": 36, "vout_min": 0.8, "vout_max": 14, "i_limit": 3.5, "operating_current": 0.00005, "quiescent_current": 0.00001, "shutdown_current":0.000005,"cost": 2.17, "theta_ja": 51.1, "t_junction_max": 125 },
 
-    { "type": "Buck", "name": "LMR60430-Q1", "vin_min": 3, "vin_max": 36, "vout_min": 1, "vout_max": 20, "i_limit": 3, "operating_current": 0.000025, "quiescent_current": 0.000005, "shutdown_current":0.000001,"cost": 1.88, "theta_ja": 84.5, "t_junction_max": 150 },
-    { "type": "Buck", "name": "TPS62813-Q1", "vin_min": 2.75, "vin_max": 6, "vout_min": 0.6, "vout_max": 5.5, "i_limit": 3, "operating_current": 0.000105, "quiescent_current": 0.000021, "shutdown_current":0.0000015,"cost": 1.90, "theta_ja": 71.1, "t_junction_max": 125 }
+    { "type": "Buck", "name": "Buck_C_Wide_Vin", "vin_min": 3, "vin_max": 36, "vout_min": 1, "vout_max": 20, "i_limit": 3, "operating_current": 0.000025, "quiescent_current": 0.000005, "shutdown_current":0.000001,"cost": 1.88, "theta_ja": 84.5, "t_junction_max": 150 },
+    { "type": "Buck", "name": "Buck_D_Low_vin", "vin_min": 2.75, "vin_max": 6, "vout_min": 0.6, "vout_max": 5.5, "i_limit": 3, "operating_current": 0.000105, "quiescent_current": 0.000021, "shutdown_current":0.0000015,"cost": 1.90, "theta_ja": 71.1, "t_junction_max": 125 }
   ],
 
   "loads": [
@@ -40,7 +40,7 @@
 
     ],
     "thermal_margin_percent": 0.10,
-    "max_sleep_current": 0.001,
+    "max_sleep_current": 0.0010,
     "parallel_search_settings": {
       "enabled": true,
       "max_solutions_to_generate": 50
